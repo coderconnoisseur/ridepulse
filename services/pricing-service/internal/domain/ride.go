@@ -17,4 +17,5 @@ type RidePricedEvent struct{
 	Price float64
 	Currency string
 	SurgeMultiplier float64
+	Pickup Location
 }
