@@ -1,10 +1,12 @@
 package simulator
 
 import (
+	"context"
 	"fmt"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
-	"context"
+	"log"
 	// "github.com/redis/go-redis/v9"
 	"ridepulse/services/driver-simulator/internal/redis"
 )
@@ -16,6 +18,7 @@ type Driver struct{
 type Simulator struct{
 	drivers []Driver
 }
+var updates int64;
 func New(numDrivers int )*Simulator{
 	drivers:=make([]Driver,numDrivers)
 	
@@ -25,6 +28,7 @@ func New(numDrivers int )*Simulator{
 			Lat:12.9 + rand.Float64()*0.02,
 			Lng:77.6 + rand.Float64()*0.02,
 		}
+		atomic.AddInt64(&updates,1)
 	}
 	return &Simulator{drivers:drivers}
 }
@@ -34,6 +38,16 @@ func (d *Driver)Move(){
 }
 
 func (s *Simulator)Run(ctx context.Context,redisClient *redis.Client){
+
+	go func(){
+			ticker:=time.NewTicker(1*time.Second)
+			defer ticker.Stop()
+			for range ticker.C{
+				count:=atomic.SwapInt64(&updates,0)
+				log.Printf("Drivers updates /sec : %d",count)
+			}
+		}()
+
 	for i:=range(s.drivers){
 		driver:=&s.drivers[i]
 		go func (d *Driver){
@@ -43,16 +57,21 @@ func (s *Simulator)Run(ctx context.Context,redisClient *redis.Client){
 					select{
 					case<-ticker.C:
 						d.Move()
-						redisClient.UpdateDriverLocation(
+						err:=redisClient.UpdateDriverLocation(
 							ctx,
 							d.ID,
 							d.Lat,
 							d.Lng,
 						)
+						if err==nil{
+							atomic.AddInt64(&updates,1)
+						}
 						case<-ctx.Done():
 							return
 					}
 				}
 		}(driver)
+		
 	}
+	
 }

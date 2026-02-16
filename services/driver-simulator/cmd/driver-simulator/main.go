@@ -8,7 +8,7 @@ import(
 func main(){
 	ctx:=context.Background()
 	r:=redis.New("localhost:6379")
-	sim:=simulator.New(100)
+	sim:=simulator.New(1000)
 	log.Println("starting driver simulator")
 	sim.Run(ctx,r)
 	select{}
