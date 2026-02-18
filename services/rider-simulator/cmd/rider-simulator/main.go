@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"log"
-	"time"
+	// "time"
 	"ridepulse/services/rider-simulator/internal/simulator"
 )
 func main() {
@@ -11,7 +11,7 @@ func main() {
 	s := simulator.New("http://localhost:8080/rides")
 	log.Println("Starting rider simulator...")
 	// example: 10 workers, each 10 req/sec → 100 RPS
-	s.Run(ctx, 50, 100*time.Millisecond)
+	s.Run(ctx, 500,200)
 
 	select {}
 }
