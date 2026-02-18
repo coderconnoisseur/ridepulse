@@ -18,10 +18,10 @@ return &DriverRepository{client:rdb}
 }
 
 func (r *DriverRepository) FindNearbyDrivers(
+	ctx context.Context,
 	lat,lng float64,
 	radiusKm float64,
 )([]string ,error){
-	ctx:=context.Background()
 	res,err:=r.client.GeoRadius(
 		ctx,
 		"drivers:locations",
@@ -44,10 +44,11 @@ func (r *DriverRepository) FindNearbyDrivers(
 	}
 
 func (r*DriverRepository) TryLockDriver(
+	ctx context.Context,
 	driverID,
 	RideID string,
 )(bool,error){
-	ctx:=context.Background()
+	
 	key:=fmt.Sprintf("driver:lock:%s",driverID)
 	ok,err:=r.client.SetNX(
 		ctx,

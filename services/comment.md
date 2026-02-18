@@ -1,30 +1,32 @@
-beta benchmarking
-@500RPS     
+Made some changes , for example :
+increased the number of workers in worker pool to 5 times the number of CPU cores, added context to the DriverRepository interface methods.
+Increased the time to wait for a driver to be locked to 400 milliseconds in the matching service.
 
-This time with increased radius to 50 KM so that we have more drivers to choose from and see how the system performs under load.
+Metrics:
+250–350 RPS
+Latency: 600ms–900ms
+Errors: 0
 
+The drivers are getting locked .
 logs:
-026/02/18 01:09:34 Trying driver: driver-186 2026/02/18 01:09:34 Trying driver: driver-985 2026/02/18 01:09:34 Trying driver: driver-930 2026/02/18 01:09:34 Trying driver: driver-875 2026/02/18 01:09:34 Trying driver: driver-391 2026/02/18 01:09:34 Locked driver: driver-186 2026/02/18 01:09:34 Trying driver: driver-786 2026/02/18 01:09:34 Trying driver: driver-805
+2026/02/18 15:39:39 Found 20 nearby drivers
+2026/02/18 15:39:39 Trying driver: driver-35
+2026/02/18 15:39:39 Found 20 nearby drivers
+2026/02/18 15:39:39 Trying driver: driver-616
+2026/02/18 15:39:39 Trying driver: driver-347
+2026/02/18 15:39:39 Trying driver: driver-11
+2026/02/18 15:39:39 Trying driver: driver-8
 
-RPS dropped , latency exploded 
+Drivers exist
+But they get locked by other concurrent rides before ride can get them <=> High (resource)contention in a hot region
+Progressive batching did help to reduce the contention but it is still high in some cases. 
+Occasional spikes in latency and drop in RPS are observed due to this contention.
 
-analysis:
-In small radius testing , fewer radius operation took place , so even if there was a failure , it would be very quick.
-In large radius testing  many Redis lookup and lock attempts were made , so more CPU  + network
+but logs show some drivers are getting hit repeatedly , they're hot-drivers (getting hit repeatedly) .
 
-For each ride, matching is trying multiple locks sequentially.
+thought:
+maybe instead of shuffling entire list , i can add random offset to the starting index and then iterate circularly .
+Also, about failure strategy , current failure strategy is to fail immediately if driver lock fails , 
+maybe i can add strategy such as retry or queuing or expanding radius or smth else .
 
-Each lock = Redis roundtrip
-
-Under load, many locks fail
-
-Each retry adds latency
-
-Worker pool gets blocked
-
-Backpressure propagates to API
-
-Kafka waits longer
-
-RPS drops
-BOTTLENECK : SEQUENTIAL LOCKING IN MATCHING SERVICE
+I'm still facing backpressure.

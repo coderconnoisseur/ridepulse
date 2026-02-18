@@ -14,7 +14,7 @@ type WorkerPool struct {
 
 func NewWorkerPool(bufferSize int) *WorkerPool {
 	return &WorkerPool{
-		workers: runtime.NumCPU(),
+		workers: runtime.NumCPU()*5,
 		queue:   make(chan domain.RidePricedEvent, bufferSize),
 	}
 }

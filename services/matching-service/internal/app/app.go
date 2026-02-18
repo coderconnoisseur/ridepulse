@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"log"
+	"time"
 
 	"ridepulse/services/matching-service/internal/domain"
 	"ridepulse/services/matching-service/internal/kafka"
@@ -22,17 +23,18 @@ func Run() error {
 	publisher := kafka.NewKafkaPublisher([]string{"localhost:9092"})
 
 	// --- Worker pool ---
-	pool := NewWorkerPool(100)
+	pool := NewWorkerPool(1000)
 
 	pool.Start(ctx, func(event domain.RidePricedEvent) error {
-
-		match, err := matcher.Match(event)
+		jobctx,cancel:=context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		match, err := matcher.Match(jobctx,event)
 		if err != nil {
 			log.Printf("matching failed for ride %s: %v", event.RideID, err)
 			return err
 		}
 
-		return publisher.PublishRideMatched(ctx, match)
+		return publisher.PublishRideMatched(jobctx, match)
 	})
 
 	// --- Kafka consumer → enqueue ---
