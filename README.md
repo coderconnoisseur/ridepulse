@@ -20,6 +20,7 @@ RidePulse is a high-throughput, event-driven ride-matching system designed to si
 ##  Architecture Overview
 
 RidePulse follows an event-driven microservices design where each component has a single, well-scoped responsibility:
+![RidePulse Architecture](./assets/Architecture.png)
 
 | Component | Role |
 |---|---|
