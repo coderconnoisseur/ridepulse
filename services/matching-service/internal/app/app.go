@@ -3,15 +3,33 @@ package app
 import (
 	"context"
 	"log"
+	"math/rand"
 	"time"
 
+	"ridepulse/services/matching-service/internal/metrics"
 	"ridepulse/services/matching-service/internal/domain"
 	"ridepulse/services/matching-service/internal/kafka"
 	"ridepulse/services/matching-service/internal/matching"
 	"ridepulse/services/matching-service/internal/redis"
+	"net/http"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func Run() error {
+	metrics.Register()
+	go func() {
+	http.Handle("/metrics", promhttp.Handler())
+	log.Println("Prometheus metrics running on :2112")
+
+	server := &http.Server{
+		Addr:         ":2112",
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	}
+
+	server.ListenAndServe()
+}()
+
 
 	ctx := context.Background()
 
@@ -21,9 +39,9 @@ func Run() error {
 
 	consumer := kafka.NewKafkaConsumer([]string{"localhost:9092"})
 	publisher := kafka.NewKafkaPublisher([]string{"localhost:9092"})
-
+	rand.Seed(time.Now().UnixNano())
 	// --- Worker pool ---
-	pool := NewWorkerPool(1000)
+	pool := NewWorkerPool(200)
 
 	pool.Start(ctx, func(event domain.RidePricedEvent) error {
 		jobctx,cancel:=context.WithTimeout(ctx, 300*time.Millisecond)

@@ -5,6 +5,7 @@ import(
 "fmt"
 "time"
 "github.com/redis/go-redis/v9"
+"ridepulse/services/matching-service/internal/metrics"
 )
 type DriverRepository struct{
 	client *redis.Client
@@ -22,6 +23,7 @@ func (r *DriverRepository) FindNearbyDrivers(
 	lat,lng float64,
 	radiusKm float64,
 )([]string ,error){
+	start:=time.Now()
 	res,err:=r.client.GeoRadius(
 		ctx,
 		"drivers:locations",
@@ -33,6 +35,7 @@ func (r *DriverRepository) FindNearbyDrivers(
 			Count:20,
 			Sort: "ASC",
 		},).Result()
+	metrics.RedisGeoLatency.Observe(time.Since(start).Seconds())
 	if err!=nil{
 		return nil,err
 	}
@@ -40,6 +43,7 @@ func (r *DriverRepository) FindNearbyDrivers(
 	for _ ,r :=range res{
 		drivers=append(drivers,r.Name)
 	}
+	metrics.NearbyDriversGauge.Set(float64(len(drivers)))
 		return drivers,nil
 	}
 
@@ -48,7 +52,7 @@ func (r*DriverRepository) TryLockDriver(
 	driverID,
 	RideID string,
 )(bool,error){
-	
+	start:=time.Now()
 	key:=fmt.Sprintf("driver:lock:%s",driverID)
 	ok,err:=r.client.SetNX(
 		ctx,
@@ -56,5 +60,14 @@ func (r*DriverRepository) TryLockDriver(
 		RideID,
 		3*time.Second,	//time to live =3sec for this lock
 	).Result()
-	return ok,err
+	metrics.DriverLockLatency.Observe(time.Since(start).Seconds())
+	if err!=nil{
+		return false,err
+	}
+	if ok{
+		metrics.DriverLockSuccess.Inc()
+	}else{
+		metrics.DriverLockConflict.Inc()
+	}
+	return ok,nil
 }
