@@ -5,7 +5,7 @@
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white)
 
-# 🚕 RidePulse
+#  RidePulse
 
 RidePulse is a high-throughput, event-driven ride-matching system designed to simulate real-world dispatch infrastructure under surge conditions.
 
@@ -17,7 +17,7 @@ RidePulse is a high-throughput, event-driven ride-matching system designed to si
 
 ---
 
-## 🏗 Architecture Overview
+##  Architecture Overview
 
 RidePulse follows an event-driven microservices design where each component has a single, well-scoped responsibility:
 
@@ -32,7 +32,7 @@ RidePulse follows an event-driven microservices design where each component has 
 
 ---
 
-## 🔄 Request Flow
+##  Request Flow
 
 ```
 RiderSimulator emits RideRequested
@@ -55,7 +55,7 @@ Pricing Service
 
 ---
 
-## ⚙️ Core Engineering Decisions
+##  Core Engineering Decisions
 
 ### 1. Geospatial Indexing with Redis GEO
 
@@ -104,7 +104,7 @@ Benchmarked under local load simulation:
 
 ---
 
-## 🧰 Tech Stack
+## Tech Stack
 
 - **Golang** — Concurrency primitives, Goroutines, Contexts
 - **Kafka** — Event streaming and ingestion decoupling
@@ -115,7 +115,7 @@ Benchmarked under local load simulation:
 
 ---
 
-## 🏃 Running RidePulse
+##  Running RidePulse
 
 ### Prerequisites
 
