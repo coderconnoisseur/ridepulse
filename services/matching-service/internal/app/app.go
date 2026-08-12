@@ -15,6 +15,24 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Deadlines for the per-ride processing pipeline.
+//
+// matchDeadline is the total wall-clock budget the matcher has for finding a
+// driver. It must be strictly greater than matching.BatchDeadline so that at
+// least one batch attempt fits inside it. In practice we size it as
+// roughly (matching.BatchDeadline * desiredBatchAttempts) so contention on a
+// hotspot can traverse multiple batches before giving up.
+//
+// publishDeadline is a SEPARATE budget for emitting ride.matched to Kafka.
+// It was previously sharing the match deadline via a single 300 ms context,
+// which meant a match that took 250 ms left publish with 50 ms — often not
+// enough for a Kafka WriteMessages round-trip with RequireOne, and the
+// "match succeeded but publish timed out" failure mode was silent.
+const (
+	matchDeadline   = 800 * time.Millisecond
+	publishDeadline = 300 * time.Millisecond
+)
+
 func Run() error {
 	metrics.Register()
 	go func() {
@@ -44,15 +62,21 @@ func Run() error {
 	pool := NewWorkerPool(200)
 
 	pool.Start(ctx, func(event domain.RidePricedEvent) error {
-		jobctx,cancel:=context.WithTimeout(ctx, 300*time.Millisecond)
-		defer cancel()
-		match, err := matcher.Match(jobctx,event)
+		matchCtx, matchCancel := context.WithTimeout(ctx, matchDeadline)
+		defer matchCancel()
+
+		match, err := matcher.Match(matchCtx, event)
 		if err != nil {
 			log.Printf("matching failed for ride %s: %v", event.RideID, err)
 			return err
 		}
 
-		return publisher.PublishRideMatched(jobctx, match)
+		// Publish gets its OWN budget derived from the pool's ctx, not from
+		// matchCtx. A match that used most of matchDeadline must not starve
+		// the Kafka write of its round-trip budget.
+		publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
+		defer publishCancel()
+		return publisher.PublishRideMatched(publishCtx, match)
 	})
 
 	// --- Kafka consumer → enqueue ---

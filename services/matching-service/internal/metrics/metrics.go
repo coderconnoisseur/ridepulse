@@ -37,6 +37,12 @@ var (
 			Help: "Total driver lock conflicts",
 		},
 	)
+	DriverLockReleasedPhantom = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "driver_lock_released_phantom_total",
+			Help: "Driver locks acquired by a batch goroutine but released because another goroutine had already been chosen as the batch winner. Non-zero values indicate the phantom-lock guard is doing work.",
+		},
+	)
 	NearbyDriversGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "nearby_drivers_current",
@@ -111,5 +117,6 @@ func Register() {
 		DriverLockLatency,
 		DriverLockSuccess,
 		DriverLockConflict,
+		DriverLockReleasedPhantom,
 	)
 }
