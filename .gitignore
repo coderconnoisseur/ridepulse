@@ -1,0 +1,8 @@
+# Compiled Go binaries
+*.exe
+*.test
+*.out
+
+# OS metadata
+.DS_Store
+Thumbs.db
