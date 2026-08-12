@@ -11,9 +11,9 @@ RidePulse is a high-throughput, event-driven ride-matching system designed to si
 
 **Core focus areas:**
 - Low-latency geospatial matching
-- High-concurrency locking
-- Contention-aware system design
-- Observability-driven performance tuning
+- High-concurrency locking with explicit phantom-lock release
+- Contention-aware batching and progressive deadline hierarchy
+- Observability-driven performance tuning end-to-end
 
 ---
 
@@ -24,34 +24,47 @@ RidePulse follows an event-driven microservices design where each component has 
 
 | Component | Role |
 |---|---|
-| **Rider Simulator** | Emits ride requests at configurable RPS |
-| **Driver Simulator** | Continuously updates live driver locations |
-| **Kafka** | Decouples ingestion from processing |
-| **Matching Service** | Performs proximity search and atomic driver locking |
-| **Redis** | GEO indexing and distributed driver locking |
-| **Prometheus** | Latency, contention, and success-rate monitoring |
+| **Rider Simulator** | Generates ride requests at configurable RPS against the HTTP gateway |
+| **API Gateway** | Accepts `POST /rides`, publishes `ride.requested` to Kafka |
+| **Pricing Service** | Consumes `ride.requested`, computes fare, publishes `ride.priced` |
+| **Matching Service** | Consumes `ride.priced`, runs geospatial search + atomic driver locking, publishes `ride.matched` |
+| **Assignment Service** | Consumes `ride.matched`, records the assignment, exposes end-to-end latency metrics |
+| **Driver Simulator** | Continuously updates live driver locations in Redis GEO |
+| **Kafka** | Decouples every stage of the pipeline |
+| **Redis** | GEO indexing and distributed driver locking (with Lua safe-unlock) |
+| **Prometheus** | Latency, contention, and success-rate monitoring at every stage |
 
 ---
 
 ##  Request Flow
 
 ```
-RiderSimulator emits RideRequested
-       │
-       ▼
-   Kafka Topic
-       │
-       ▼
-Pricing Service
-       |
-       ▼
- Matching Service
-       │
-       ├── Redis GEO → fetch nearby drivers from DriverSimulator
-       │
-       ├── SETNX + TTL → attempt atomic lock per driver
-       │
-       └── on success → emit RideMatched
+RiderSimulator ──HTTP POST /rides──▶ API Gateway
+                                        │  (stamps RequestedAt)
+                                        ▼
+                                Kafka: ride.requested
+                                        │
+                                        ▼
+                                 Pricing Service
+                                        │
+                                        ▼
+                                 Kafka: ride.priced
+                                        │
+                                        ▼
+                                 Matching Service
+                                        │
+                                        ├── Redis GEORADIUS → nearby drivers
+                                        ├── tier-preserving shuffle
+                                        ├── SETNX + TTL → atomic driver lock
+                                        │   (batch losers explicitly released)
+                                        ▼
+                                 Kafka: ride.matched
+                                        │
+                                        ▼
+                                Assignment Service
+                                        │
+                                        ▼
+                        records assignment; end_to_end_latency
 ```
 
 ---
@@ -62,56 +75,87 @@ Pricing Service
 
 Driver locations are stored and queried using Redis's native GEO commands, enabling sub-millisecond radius-based lookups without a dedicated spatial database. This keeps the hot path lean and the driver discovery step real-time.
 
-### 2. Atomic Driver Locking
+### 2. Atomic Driver Locking with phantom-lock release
 
-```redis
+```
 SETNX driver:lock:<id> <ride_id> EX 3
 ```
 
-Each driver is locked atomically before assignment. The TTL guarantees that locks are automatically released on service failure or timeout, making the system safe under high concurrency without explicit unlock logic in the happy path.
+Each driver is locked atomically before assignment. Because the matcher races 5 goroutines per batch and any of them can `SETNX`-win, the batch race can produce **more than one successful lock per ride**. The extras are released via a Lua `GET`-then-`DEL` safe-unlock so they never sit in Redis as phantom locks blocking future rides. The `driver_lock_released_phantom_total` counter makes this visible.
 
-### 3. Progressive Parallel Locking
+Full write-up: [phantom-lock-fix.md](docs/phantom-lock-fix.md).
 
-Rather than attempting all candidate drivers simultaneously (causing thundering herd issues), RidePulse:
-- Shuffles the driver list to avoid hotspots
-- Attempts locks in bounded parallel batches
-- Uses context-based deadlines to prevent lock storms
-- Sheds tail latency under surge by failing fast on overloaded paths
+### 3. Tier-preserving batch shuffle
 
-### 4. Worker Pool with Bounded Concurrency
+`GEORADIUS` returns drivers nearest-first — the signal we want to preserve. But under a demand hotspot, every ride's "top 5 nearest" is the same set, and pure nearest-first cascades into lock contention. Full random shuffle destroys the geospatial signal entirely.
+
+The matcher shuffles **within** distance tiers of size 10, keeping tier order intact. Under spread load this recovers pure nearest-first; under hotspot load it spreads contention across the top-10 instead of pinning it to the top-5, without ever trying a farther driver before a nearer one.
+
+Full write-up: [shuffle-nearest-first-fix.md](docs/shuffle-nearest-first-fix.md).
+
+### 4. Progressive Parallel Locking with hierarchical deadlines
+
+Each match has its own 800 ms budget; each batch of 5 parallel `SETNX` attempts has a 200 ms budget nested inside it; Kafka publish gets its own independent 300 ms budget so a slow match can't starve the publish RTT.
+
+Full write-up: [deadline-fix.md](docs/deadline-fix.md).
+
+### 5. Worker Pool with Bounded Concurrency
 
 A CPU-aware worker pool sits between Kafka consumption and matching logic. This provides natural backpressure — if matching falls behind, the pool queue fills rather than spawning unbounded goroutines, preventing memory blowup under load spikes.
 
-### 5. Observability-Driven Tuning
+### 6. Observability-Driven Tuning
 
-Every performance decision in RidePulse was informed by Prometheus metrics rather than assumptions. The instrumentation tracks:
-- Match latency (p50, p95, p99)
-- Lock conflict rate
-- Redis query latency
-- Overall match success rate
+Every stage exposes Prometheus metrics on its own port. `RequestedAt` is stamped at the api-gateway and propagated through every event so the terminal consumer can measure true end-to-end latency, not just per-stage latency.
 
-This makes it straightforward to detect regressions, tune batch sizes, and validate changes under simulated load.
+Key exports:
+- `gateway_request_duration_seconds`, `gateway_requests_total`, `gateway_publish_errors_total`
+- `pricing_processing_duration_seconds`, `pricing_events_published_total`
+- `matching_latency_seconds`, `matching_success_total`, `matching_failures_total`
+- `driver_lock_conflict_total`, `driver_lock_released_phantom_total`
+- `end_to_end_latency_seconds`, `assignments_total`
 
 ---
 
-## 🚀 Performance Characteristics
+##  Benchmarks
 
-Benchmarked under local load simulation:
+The [`tools/benchmark`](tools/benchmark) runner walks a configurable RPS ladder against a running cluster, samples Prometheus at each step, and writes one CSV row per step.
 
-- **Throughput:** 300–500 RPS sustained
-- **Match latency:** Sub-second average
-- **Lock contention:** Observable and measurable under hotspot traffic patterns
-- **Overload behavior:** Deadline-based load shedding kicks in gracefully
+The latest run is committed here:
+
+📊 **[tools/benchmark/benchmark-results.csv](tools/benchmark/benchmark-results.csv)**
+
+Headline from that run (Windows dev box, single-partition Kafka, single Redis, ~8 cores):
+
+| What | Value |
+|---|---|
+| Peak intake at gateway | ~400 RPS |
+| Peak end-to-end assignment throughput | ~150 rides/sec |
+| Peak "healthy" throughput (>95 % success) | ~50 RPS |
+| Successful `matching_latency_seconds` p95 | stayed 33–84 ms across every step |
+
+The primary bottleneck is matcher pool starvation from slow-fail matches: under contention, ~30 % of matches consume workers for the full 800 ms `matchDeadline`, blowing past `NumCPU × 5` worker capacity. Fixing this (fail-fast on batch 1 saturation, multi-partition Kafka topics, larger pool) is the next set of unlocks.
+
+See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook, ladder shape, PromQL queries, and interpretation notes.
+
+---
+
+## Documentation
+
+Deep-dive engineering notes on the correctness and reliability changes:
+
+- 📄 [Phantom-lock race fix](docs/phantom-lock-fix.md)
+- 📄 [Deadline hierarchy fix](docs/deadline-fix.md)
+- 📄 [Shuffle vs nearest-first fix](docs/shuffle-nearest-first-fix.md)
+- 📄 [RPS benchmarking setup](docs/rps-benchmarking-setup.md)
 
 ---
 
 ## Tech Stack
 
-- **Golang** — Concurrency primitives, Goroutines, Contexts
+- **Go 1.25** — Concurrency primitives, goroutines, contexts; Gin for the HTTP gateway
 - **Kafka** — Event streaming and ingestion decoupling
-- **Redis** — GEO indexing and atomic distributed locking
-- **PostgreSQL** — Extensible persistence layer
-- **Docker** — Service orchestration
+- **Redis** — GEO indexing and atomic distributed locking (with Lua safe-unlock)
+- **Docker Compose** — Infrastructure orchestration
 - **Prometheus** — Metrics and observability
 
 ---
@@ -121,53 +165,80 @@ Benchmarked under local load simulation:
 ### Prerequisites
 
 - Docker and Docker Compose installed
-- Go 1.21+
+- Go 1.25+
 
 ### 1. Start Infrastructure
 
-From the project root, bring up Kafka and Redis:
+From `deployment/`, bring up Kafka, Zookeeper, Redis, and Prometheus:
 
 ```bash
+cd deployment
 docker-compose up -d
 ```
 
-Verify that:
-- Kafka is reachable at `localhost:9092`
-- Redis is reachable at `localhost:6379`
+Verify:
+- Kafka: `localhost:9092`
+- Redis: `localhost:6379`
+- Prometheus UI: http://localhost:9090
 
-### 2. Start the Matching Service
-
-```bash
-cd services/matching-service
-go run cmd/matching-service/main.go
-```
-
-Prometheus metrics are exposed at `http://localhost:2112/metrics`.
-
-### 3. Start the Driver Simulator
+### 2. Start the services (one terminal each)
 
 ```bash
-cd services/driver-simulator
-go run cmd/driver-simulator/main.go
+cd services/matching-service   && go run cmd/matching-service/main.go
+cd services/pricing-service    && go run cmd/pricing-service/main.go
+cd services/assignment-service && go run cmd/assignment-service/main.go
+cd services/driver-simulator   && go run cmd/driver-simulator/main.go
+cd services/api-gateway        && go run cmd/api-gateway/main.go
 ```
 
-This continuously pushes driver location updates into Redis GEO.
+Prometheus scrape targets:
 
-### 4. Start the Rider Simulator
+| Service | `/metrics` endpoint |
+|---|---|
+| api-gateway | `:8080/metrics` |
+| pricing-service | `:2115/metrics` |
+| matching-service | `:2112/metrics` |
+| assignment-service | `:2114/metrics` |
+
+Confirm all four are `up` at http://localhost:9090/targets.
+
+### 3. Send load
+
+**Automated ladder (recommended):**
+
+```bash
+cd tools/benchmark
+go run cmd/benchmark/main.go
+```
+
+Walks `50:20,100:40,200:80,300:120,500:200,800:300` (RPS:concurrency) by default and writes [`benchmark-results.csv`](tools/benchmark/benchmark-results.csv). Configurable via `--ladder`, `--warmup`, `--window`, `--cooldown`, `--output`.
+
+**Manual, one RPS level:**
 
 ```bash
 cd services/rider-simulator
-go run cmd/rider-simulator/main.go
+RIDER_RPS=300 RIDER_CONCURRENCY=120 go run cmd/rider-simulator/main.go
 ```
 
-Generates ride requests at a configurable RPS rate.
+### 4. Monitor
 
-### 5. Monitor Metrics
+Prometheus at http://localhost:9090. Key queries:
 
-Scrape metrics directly or connect a Prometheus + Grafana stack. Key metrics to watch:
+```promql
+# End-to-end assignment rate
+rate(assignments_total[1m])
 
-| Metric | Description |
-|---|---|
-| `matching_latency_seconds` | End-to-end match duration |
-| `driver_lock_conflict_total` | Lock contention counter |
-| `matching_success_total` | Successful match counter |
+# End-to-end p95 latency
+histogram_quantile(0.95, sum by (le) (rate(end_to_end_latency_seconds_bucket[1m])))
+
+# Where matches are failing (contention vs deadline)
+rate(driver_lock_conflict_total[1m])
+rate(driver_lock_released_phantom_total[1m])
+```
+
+Verify pipeline closure by querying assignment-service directly:
+
+```bash
+curl http://localhost:2114/count            # total assignments observed
+curl http://localhost:2114/assignments/<id> # look up a specific ride
+```
