@@ -11,6 +11,7 @@ type RideRequestedEvent struct{
 	RideId string
 	Pickup Location
 	Drop Location
+	RequestedAt int64 // UnixNano, propagated end-to-end for latency measurement
 }
 type RidePricedEvent struct{
 	RideId string
@@ -18,4 +19,5 @@ type RidePricedEvent struct{
 	Currency string
 	SurgeMultiplier float64
 	Pickup Location
+	RequestedAt int64 // carried through from RideRequestedEvent
 }

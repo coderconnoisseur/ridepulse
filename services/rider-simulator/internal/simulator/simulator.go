@@ -5,9 +5,27 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"sync/atomic"
 	"time"
+)
+
+// Bounding box for pickup and drop sampling.
+//
+// The driver-simulator seeds drivers in [12.9, 12.92] × [77.6, 77.62] and lets
+// them drift by ±0.001 per tick. Rides must be sampled from a region that
+// overlaps this driver cluster, otherwise Redis GEORADIUS returns zero
+// candidates and every ride fails with "no drivers available."
+//
+// This box is centred on the driver cluster and extends ~3 km in each
+// direction, so pickups and drops spread across ~6 km × 6 km — enough to
+// break the fixed-point hotspot that made every ride land on the same top-5
+// nearest drivers.
+const (
+	boxMinLat = 12.88
+	boxMinLng = 77.58
+	boxSpan   = 0.06 // ~6 km at this latitude
 )
 
 type Simulator struct {
@@ -42,10 +60,10 @@ var totalLatency int64
 
 func (s *Simulator) sendRide(ctx context.Context) {
 	req := RideRequest{}
-	req.Pickup.Lat = 12.9
-	req.Pickup.Lng = 77.6
-	req.Drop.Lat = 12.93
-	req.Drop.Lng = 77.65
+	req.Pickup.Lat = boxMinLat + rand.Float64()*boxSpan
+	req.Pickup.Lng = boxMinLng + rand.Float64()*boxSpan
+	req.Drop.Lat = boxMinLat + rand.Float64()*boxSpan
+	req.Drop.Lng = boxMinLng + rand.Float64()*boxSpan
 	body, _ := json.Marshal(req)
 	start:= time.Now()
 	resp,err:= s.client.Post(

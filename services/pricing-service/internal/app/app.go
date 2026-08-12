@@ -1,30 +1,67 @@
-//dependency wiring
+// dependency wiring
 package app
-import(
+
+import (
 	"context"
-	// "log"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"ridepulse/services/pricing-service/internal/domain"
 	"ridepulse/services/pricing-service/internal/kafka"
+	"ridepulse/services/pricing-service/internal/metrics"
 	"ridepulse/services/pricing-service/internal/pricing"
-	// "ridepulse/services/pricing-service/internal/ports"
 )
 
-func Run()error{
-	ctx:=context.Background()//for a graceful shutdown
+const metricsAddr = ":2115"
 
-	consumer:=kafka.NewKafkaConsumer(	//creation of NewKafkaConsumer  
-		[]string{"localhost:9092"},		//broker running at localhost:9092,as of now single broker , might scale in future
-		"pricing-service",			//group id for consumer group , if i scale this service to multiple instances they will share the same group id and kafka will load balance messages between them
-		"ride.requested",			//name of topic to consume from 
+func Run() error {
+	metrics.Register()
+
+	// Prometheus scrape endpoint on its own port. Uses a dedicated ServeMux so
+	// it can't collide with anything registered on http.DefaultServeMux.
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		server := &http.Server{
+			Addr:         metricsAddr,
+			Handler:      mux,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
+		}
+		log.Printf("pricing-service metrics listening on %s", metricsAddr)
+		_ = server.ListenAndServe()
+	}()
+
+	ctx := context.Background() // TODO: wire real graceful shutdown
+
+	consumer := kafka.NewKafkaConsumer(
+		[]string{"localhost:9092"},
+		"pricing-service",
+		"ride.requested",
 	)
-	publisher:=kafka.NewKafkaPublisher([]string{"localhost:9092"})
-	pool:=NewWorkerPool(100)	//creating a worker pool with buffersize 100(my buffer will handle 100 events before blocking , after that backpressure will kick)
-	pool.Start(ctx,func(event domain.RideRequestedEvent)error{
-		// log.Printf("Recieved Event: %+v",event)//for now just log the event , later ill implement pricing logic here
-		priced:=pricing.ComputePrice(event)
-		return publisher.PublishRidePriced(ctx,priced)
+	publisher := kafka.NewKafkaPublisher([]string{"localhost:9092"})
+
+	pool := NewWorkerPool(100)
+	pool.Start(ctx, func(event domain.RideRequestedEvent) error {
+		start := time.Now()
+		defer func() {
+			metrics.ProcessingDuration.Observe(time.Since(start).Seconds())
+		}()
+
+		priced := pricing.ComputePrice(event)
+		if err := publisher.PublishRidePriced(ctx, priced); err != nil {
+			metrics.PublishErrors.Inc()
+			return err
+		}
+		metrics.EventsPublished.Inc()
+		return nil
 	})
-	return consumer.ConsumeRideRequested(func(event domain.RideRequestedEvent)error{
+
+	return consumer.ConsumeRideRequested(func(event domain.RideRequestedEvent) error {
+		metrics.EventsConsumed.Inc()
 		pool.Enqueue(event)
 		return nil
 	})

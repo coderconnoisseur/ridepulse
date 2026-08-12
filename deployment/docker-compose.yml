@@ -24,8 +24,22 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
 
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
   redis:
     image: redis:7.2
     ports:
       - "6379:6379"
 
+  # Prometheus scrapes the four Go services running on the host.
+  # host.docker.internal is the Docker Desktop DNS name for the host machine
+  # on both Windows and macOS; on Linux the extra_hosts entry below wires it
+  # up manually.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

@@ -19,5 +19,6 @@ func ComputePrice(event domain.RideRequestedEvent) domain.RidePricedEvent{
 		Currency:"INR",
 		SurgeMultiplier: 1.0,//till mvp
 		Pickup :event.Pickup,
+		RequestedAt: event.RequestedAt,
 	}
 }
