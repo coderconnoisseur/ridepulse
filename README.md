@@ -322,3 +322,7 @@ Each service is its own Go module (tied together by `services/go.work` for local
 cd services/matching-service
 go vet ./... && go build ./... && go test ./...
 ```
+
+## License
+
+[MIT](LICENSE)
