@@ -18,11 +18,12 @@ import (
 
 // Deadlines for the per-ride processing pipeline.
 //
-// matchDeadline is the total wall-clock budget the matcher has for finding a
-// driver. It must be strictly greater than matching.BatchDeadline so that at
-// least one batch attempt fits inside it. In practice we size it as
-// roughly (matching.BatchDeadline * desiredBatchAttempts) so contention on a
-// hotspot can traverse multiple batches before giving up.
+// defaultMatchDeadline is the default total wall-clock budget the matcher has
+// for finding a driver (Config.MatchDeadline, MATCH_DEADLINE). It must be
+// strictly greater than matching.BatchDeadline so that at least one batch
+// attempt fits inside it. A successful match's p95 was ~80 ms, so 500 ms
+// still fits two full batches and halves the time a worker is held on a
+// failure compared with the previous 800 ms.
 //
 // publishDeadline is a SEPARATE budget for emitting ride.matched to Kafka.
 // It was previously sharing the match deadline via a single 300 ms context,
@@ -30,16 +31,15 @@ import (
 // enough for a Kafka WriteMessages round-trip with RequireOne, and the
 // "match succeeded but publish timed out" failure mode was silent.
 const (
-	matchDeadline   = 800 * time.Millisecond
-	publishDeadline = 300 * time.Millisecond
+	defaultMatchDeadline = 500 * time.Millisecond
+	publishDeadline      = 300 * time.Millisecond
 
-	metricsAddr     = ":2112"
 	shutdownTimeout = 5 * time.Second
 )
 
 // Run serves metrics and consumes RidePriced events until ctx is cancelled,
 // then shuts everything down.
-func Run(ctx context.Context) error {
+func Run(ctx context.Context, cfg Config) error {
 	metrics.Register()
 
 	// Dedicated mux so the scrape endpoint can't collide with anything
@@ -47,27 +47,27 @@ func Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	server := &http.Server{
-		Addr:         metricsAddr,
+		Addr:         cfg.MetricsAddr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Printf("Prometheus metrics running on %s", metricsAddr)
+		log.Printf("Prometheus metrics running on %s", cfg.MetricsAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("matching-service metrics server: %v", err)
 		}
 	}()
 
 	// --- Dependencies ---
-	driverRepo := redis.NewDriverRepository("localhost:6379")
+	driverRepo := redis.NewDriverRepository(cfg.RedisAddr)
 	matcher := matching.New(driverRepo)
 
-	consumer := kafka.NewKafkaConsumer([]string{"localhost:9092"})
-	publisher := kafka.NewKafkaPublisher([]string{"localhost:9092"})
+	consumer := kafka.NewKafkaConsumer(cfg.KafkaBrokers, cfg.MatchWorkers)
+	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
 	runErr := consumer.Run(ctx, func(ctx context.Context, event domain.RidePricedEvent) error {
-		matchCtx, matchCancel := context.WithTimeout(ctx, matchDeadline)
+		matchCtx, matchCancel := context.WithTimeout(ctx, cfg.MatchDeadline)
 		defer matchCancel()
 
 		match, err := matcher.Match(matchCtx, event)
@@ -85,7 +85,7 @@ func Run(ctx context.Context) error {
 		}
 
 		// Publish gets its OWN budget derived from the handler ctx, not from
-		// matchCtx. A match that used most of matchDeadline must not starve
+		// matchCtx. A match that used most of the match deadline must not starve
 		// the Kafka write of its round-trip budget. A publish failure is
 		// returned so the message is retried and then dead-lettered.
 		publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)

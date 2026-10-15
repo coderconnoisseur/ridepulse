@@ -15,26 +15,24 @@ import (
 )
 
 const (
-	kafkaBroker     = "localhost:9092"
-	httpAddr        = ":2114"
 	shutdownTimeout = 5 * time.Second
 )
 
 // Run serves the HTTP API and consumes RideMatched events until ctx is
 // cancelled, then shuts everything down.
-func Run(ctx context.Context) error {
+func Run(ctx context.Context, cfg Config) error {
 	metrics.Register()
 	mem := store.NewMemory()
 
-	server := httpapi.NewServer(httpAddr, mem)
+	server := httpapi.NewServer(cfg.HTTPAddr, mem)
 	go func() {
-		log.Printf("assignment-service listening on %s", httpAddr)
+		log.Printf("assignment-service listening on %s", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("assignment-service http server: %v", err)
 		}
 	}()
 
-	consumer := kafka.NewKafkaConsumer([]string{kafkaBroker})
+	consumer := kafka.NewKafkaConsumer(cfg.KafkaBrokers)
 	runErr := consumer.Run(ctx, func(_ context.Context, event domain.RideMatchedEvent) error {
 		var latencyMs int64
 		if event.RequestedAt > 0 {
