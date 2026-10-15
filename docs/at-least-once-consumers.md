@@ -203,13 +203,13 @@ why the handlers have to tolerate duplicates (section 5).
 - **Partition rebalances are not handled by the tracker.** It assumes one
   assigned partition set for the life of the process. If a rebalance moved a
   partition away and back, the broker may rewind to a lower offset than the
-  tracker has seen, and the tracker would mis-order. As a guard, `track`
-detects an offset at or below the last tracked one for a partition, logs it
-and resets that partition's state, so the watermark cannot wedge; this is a
-mitigation, not a rebalance-safe design. The topics are
-  single-partition and each service runs as a single instance today, so this
-  cannot happen yet; it must be revisited before the Phase 2 multi-partition
-  work.
+  tracker has seen. After a consumer-group generation change kafka-go rewinds
+  to the last committed offset, and the tracker does not handle re-fetched
+  offsets: the commit watermark can stall (nothing is lost, because the
+  messages are redelivered on restart) and pending entries grow until the
+  process restarts. The topics are single-partition and each service runs as
+  a single instance today, so this cannot happen yet. An epoch-stamped tracker
+  reset is planned before the Phase 2 multi-partition work.
 - **Drain timeout abandons work.** After `DrainTimeout` the runner returns
   without waiting for stuck handlers; they are cancelled and their messages
   are redelivered.

@@ -1,7 +1,6 @@
 package kafkaconsumer
 
 import (
-	"log"
 	"sync"
 
 	"github.com/segmentio/kafka-go"
@@ -17,7 +16,6 @@ type partitionKey struct {
 type partitionState struct {
 	pending []kafka.Message
 	done    map[int64]struct{}
-	last    int64 // highest offset tracked so far
 }
 
 // offsetTracker decides which offset is safe to commit: a message may only
@@ -39,19 +37,10 @@ func (t *offsetTracker) track(msg kafka.Message) {
 	defer t.mu.Unlock()
 	key := partitionKey{msg.Topic, msg.Partition}
 	ps, ok := t.parts[key]
-	// An offset at or below the last tracked one means the broker rewound
-	// (e.g. a consumer-group generation change). Drop the stale state so the
-	// watermark cannot wedge; the full fix is Phase 2.
-	if ok && msg.Offset <= ps.last {
-		log.Printf("kafkaconsumer: offset rewind on %s[%d]: got %d after %d; resetting partition tracker",
-			msg.Topic, msg.Partition, msg.Offset, ps.last)
-		ok = false
-	}
 	if !ok {
 		ps = &partitionState{done: make(map[int64]struct{})}
 		t.parts[key] = ps
 	}
-	ps.last = msg.Offset
 	ps.pending = append(ps.pending, msg)
 }
 
