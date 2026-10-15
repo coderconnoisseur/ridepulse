@@ -1,40 +1,44 @@
 package main
 
 import (
-	// "fmt"
 	"context"
+	"log"
+	"net/http"
 	"os"
 	"os/signal"
-	"ridepulse/services/api-gateway/internal/app"
 	"time"
-	// "github.com/gin-gonic/gin"
-	"net/http"
 
-	// "golang.org/x/tools/go/analysis/passes/defers"
+	"ridepulse/services/api-gateway/internal/app"
 )
-func main(){
-	r:=app.NewApp()
-	
-	serv:=&http.Server{
-		Addr:":8080",
-		Handler:r,
-		
+
+func main() {
+	cfg, err := app.LoadConfig(os.Getenv)
+	if err != nil {
+		log.Fatalf("api-gateway: invalid configuration: %v", err)
 	}
-	go func(){//start server in a goroutine
-		if err:=serv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	log.Printf("api-gateway config: http=%s brokers=%v", cfg.HTTPAddr, cfg.KafkaBrokers)
+
+	r, closePublisher := app.NewApp(cfg)
+
+	serv := &http.Server{
+		Addr:    cfg.HTTPAddr,
+		Handler: r,
+	}
+	go func() { // start server in a goroutine
+		if err := serv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			panic(err)
 		}
 	}()
-	//i dont want server to shut down immediately
-	//so i am adding a channel to listen for interrupt signal
-	//it will complete graceful shutdown
+	// Block until an interrupt arrives, then shut down gracefully.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
 
-	quit:=make(chan os.Signal,1)
-	signal.Notify(quit,os.Interrupt)
-	<-quit // signal arrived here
-
-	ctx,cancel:= context.WithTimeout(context.Background(),5*time.Second)//graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	serv.Shutdown(ctx)
-
+	// In-flight handlers have drained; flush and close the Kafka writer.
+	if err := closePublisher(); err != nil {
+		log.Printf("api-gateway publisher close: %v", err)
+	}
 }

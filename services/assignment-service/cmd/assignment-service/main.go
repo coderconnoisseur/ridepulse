@@ -14,7 +14,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := app.Run(ctx); err != nil {
+	cfg, err := app.LoadConfig(os.Getenv)
+	if err != nil {
+		log.Fatalf("assignment-service: invalid configuration: %v", err)
+	}
+	log.Printf("assignment-service config: http=%s brokers=%v", cfg.HTTPAddr, cfg.KafkaBrokers)
+
+	if err := app.Run(ctx, cfg); err != nil {
 		stop()
 		log.Fatal(err)
 	}

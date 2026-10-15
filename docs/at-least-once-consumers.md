@@ -3,7 +3,8 @@
 > **Status:** local-only note. Not intended for the public repo.
 > Documents the offset-commit and failure-handling bug shared by the three
 > Kafka consumers, the shared runner that replaced it
-> (`pkg/kafkaconsumer`), and what is still not covered.
+> (`pkg/kafkaconsumer`), the epoch mechanism that handles consumer-group
+> rewinds, handler panic recovery, and what is still not covered.
 
 ---
 
@@ -64,7 +65,7 @@ fetched before N on the same partition has also reached a terminal state.
 A slow message at the head holds the watermark back; later messages that
 already finished stay in the `done` set and are committed in one go as soon
 as the head completes. Commits are serialized under a mutex, so the
-committed offset of a partition is monotonic.
+committed offset of a partition is monotonic within an epoch (see 3f).
 
 A message reaches a terminal state in exactly one of three ways:
 
@@ -96,6 +97,7 @@ The DLQ topic is the original topic plus `.dlq`:
 | `ride.requested` | `ride.requested.dlq` | pricing-service |
 | `ride.priced` | `ride.priced.dlq` | matching-service |
 | `ride.matched` | `ride.matched.dlq` | assignment-service |
+| `ride.unmatched` | `ride.unmatched.dlq` | assignment-service |
 
 The DLQ record keeps the original key and value and any original headers,
 and appends four more:
@@ -142,7 +144,50 @@ the DLQ writer and the publisher (matching also closes Redis). Fatal errors
 (a fetch error not caused by shutdown, a synchronous commit error, a DLQ
 write failure) take the same drain path and are returned to `main`.
 
-### 3e. Reader settings
+### 3e. Handler panics
+
+Each handler attempt runs under a `recover`. A panic is logged with its
+stack, wrapped as `Permanent(handler panic: ...)` and treated like any other
+permanent failure: no retries, straight to the DLQ, offset committed once
+the DLQ write succeeds. A handler that panics deterministically therefore
+costs one DLQ record per message instead of a crash loop. The panic text ends
+up in the record's `x-error` header, and the service's `*_dlq_messages_total`
+counter increments (the `OnRetry` hook does not fire, since there is no
+retry). Only panics on the handler goroutine are caught; a panic in a
+goroutine the handler itself starts still crashes the process.
+
+### 3f. Rewinds and epochs
+
+A consumer-group rebalance makes kafka-go re-fetch from the last committed
+offset, which can be lower than offsets the tracker already holds. Left
+alone, the old pending entries and the new copies would collide and the
+watermark would stall.
+
+`partitionState` therefore carries an `epoch` and `last`, the highest offset
+tracked in the current epoch. `track` compares each fetched offset with
+`last`:
+
+- offset greater than `last`: ordinary forward fetch, same epoch;
+- offset at or below `last`: the partition rewound. The tracker logs it,
+  increments the epoch, discards the old `pending` and `done` state and starts
+  tracking from the re-fetched message.
+
+`track` returns the epoch, the runner carries it with the message to its
+worker, and `done(msg, epoch)` ignores a completion whose epoch is not the
+current one (or whose offset is no longer pending). Copies that were in
+flight when the rewind happened still run to completion, but cannot move the
+watermark or trigger a commit; the re-fetched copy is processed again and
+commits normally. The cost is that such messages are handled twice, which the
+handlers already tolerate (section 5).
+
+What this does **not** detect: a rewind is only noticed when the re-fetched
+offset is `<= last`. If a partition is re-assigned to this consumer starting
+*above* the last tracked offset, nothing looks wrong to the tracker, the old
+pending entries stay, and the committed offset can end up behind where it
+was. Messages between the two are redelivered. That is still at-least-once,
+but it is redelivery the tracker did not recognize and could not suppress.
+
+### 3g. Reader settings
 
 All three readers use `CommitInterval: 1s`. `CommitMessages` therefore
 queues the offset and a background loop flushes it once a second, instead
@@ -164,18 +209,38 @@ why the handlers have to tolerate duplicates (section 5).
 | Service | Workers | Decode failure | Handler failure |
 |---|---|---|---|
 | pricing | `NumCPU` | Permanent → `ride.requested.dlq` | Publish error retried, then DLQ |
-| matching | `NumCPU × 5` | Permanent → `ride.priced.dlq` | See below |
-| assignment | 4 | Permanent → `ride.matched.dlq` | Cannot fail after decode |
+| matching | `MATCH_WORKERS` (default `NumCPU × 25`) | Permanent → `ride.priced.dlq` | See below |
+| assignment (`ride.matched`) | 4 | Permanent → `ride.matched.dlq` | Cannot fail after decode |
+| assignment (`ride.unmatched`) | 4 | Permanent → `ride.unmatched.dlq` | Cannot fail after decode |
+
+All handler panics, in any service, take the permanent path (3e).
+
+assignment-service runs two runners, one per topic, each with its own
+consumer group: `assignment-service` for `ride.matched` and
+`assignment-service-unmatched` for `ride.unmatched`. With a shared group the
+leader's metadata request for both topics fails as a whole while
+`ride.unmatched` does not exist yet (it is created lazily on the first
+business failure), which would leave the `ride.matched` reader without
+partitions too. With two groups a not-yet-existing `ride.unmatched` topic
+only delays the unmatched reader, and rebalances are independent. If one
+runner fails fatally the other is cancelled and `Run` returns the first
+error.
 
 **Matching** splits `Match` errors in `app.go`:
 
 - `ErrNoDriversAvailable`, and `context.DeadlineExceeded` when it is the
-  outer match deadline (`matchCtx.Err() != nil`), are business failures. The handler logs, returns `nil`, and the offset is committed.
-  The ride is currently dropped: nothing tells the rider or downstream
-  systems. Emitting a `ride.unmatched` event is roadmap item 1c.
-- Any other `Match` error (Redis failures, and any other
-  `DeadlineExceeded` such as the detached assign timeout) is returned, so the runner
-  retries it and eventually dead-letters it. Retrying is safe because
+  outer match deadline (`matchCtx.Err() != nil`), are business failures.
+  The handler logs and publishes a `ride.unmatched` event (reason
+  `no_drivers` or `match_deadline`, 300 ms publish budget), then returns
+  `nil` and the offset is committed. If that publish fails the error is
+  returned, so the runner retries and eventually dead-letters it like any
+  other infrastructure error. See
+  [driver-state-model.md](driver-state-model.md#4b-the-unmatched-path).
+- Any other `Match` error is returned. That covers
+  Redis failures, any `DeadlineExceeded` that is not the outer match deadline,
+  and every `AssignDriver` failure (wrapped in `matching.ErrAssign`, such as
+  the detached assign timeout), which is retried even if the outer deadline
+  has expired by then. The runner retries and eventually dead-letters these. Retrying is safe because
   `Match` replays an existing assignment instead of matching again
   (see [driver-state-model.md](driver-state-model.md)).
 - Publishing `ride.matched` has its own 300 ms budget; a publish failure is
@@ -186,30 +251,29 @@ why the handlers have to tolerate duplicates (section 5).
 ## 5. Trade-offs and known behaviour
 
 - **Duplicates are possible.** A crash after the handler succeeded but
-  before the 1 s commit flush redelivers the message. Pricing is a pure
-  function plus a publish, so a duplicate `ride.priced` is harmless to
-  pricing itself but flows downstream. Matching deduplicates by ride
-  through `ride:driver:<rideID>`. **Assignment-service has no dedupe**: a
-  duplicate `ride.matched` overwrites the in-memory record for the ride
-  (it is keyed by ride ID) but increments `assignments_total` and the
-  latency histogram again. Full dedupe there is roadmap item 1e.
+  before the 1 s commit flush redelivers the message, as does a rewind
+  (3f). Pricing is a pure function plus a publish, so a duplicate
+  `ride.priced` is harmless to pricing itself but flows downstream. Matching
+  deduplicates by ride through `ride:driver:<rideID>`. Assignment-service
+  deduplicates in its store: the first `ride.matched` for a ride is recorded
+  and counted in `assignments_total` and `end_to_end_latency_seconds`; later
+  ones only increment `assignment_duplicates_total`. A ride has one outcome:
+  matched wins over unmatched (a `ride.matched` replaces an earlier
+  unmatched record, a later `ride.unmatched` is ignored and counted in
+  `unmatched_duplicates_total`). The store is in memory, so after an
+  assignment-service restart a redelivered event is new again.
 - **One slow message delays commits, not processing.** Other workers keep
   going; the watermark simply does not advance past the stuck message, so a
   crash replays everything after it. Retries are bounded (4 attempts, ≤ 1 s
   backoff), so a stuck head is bounded too.
-- **Handler panics are not recovered.** A panic in a handler crashes the
-  process, and the message is redelivered on restart. If it panics
-  deterministically, that is a crash loop rather than a DLQ entry.
-- **Partition rebalances are not handled by the tracker.** It assumes one
-  assigned partition set for the life of the process. If a rebalance moved a
-  partition away and back, the broker may rewind to a lower offset than the
-  tracker has seen. After a consumer-group generation change kafka-go rewinds
-  to the last committed offset, and the tracker does not handle re-fetched
-  offsets: the commit watermark can stall (nothing is lost, because the
-  messages are redelivered on restart) and pending entries grow until the
-  process restarts. The topics are single-partition and each service runs as
-  a single instance today, so this cannot happen yet. An epoch-stamped tracker
-  reset is planned before the Phase 2 multi-partition work.
+- **Rewind detection is partial.** Epochs (3f) handle a rewind to an offset
+  `<= last`. A partition re-assigned starting above the last tracked offset
+  is not detected, and the committed offset can move backwards, causing
+  redelivery. At-least-once still holds. The topics are single-partition and
+  each service runs as a single instance today, so neither case has been
+  seen outside unit tests.
+- **Panic recovery covers the handler goroutine only** (3e). A panic in a
+  goroutine the handler spawns is not caught.
 - **Drain timeout abandons work.** After `DrainTimeout` the runner returns
   without waiting for stuck handlers; they are cancelled and their messages
   are redelivered.
@@ -223,6 +287,8 @@ why the handlers have to tolerate duplicates (section 5).
 | `pricing_retries_total`, `matching_retries_total` | Handler attempts that failed and were retried. |
 | `pricing_dlq_messages_total`, `matching_dlq_messages_total`, `assignment_dlq_messages_total` | Messages written to the service's DLQ topic. Should stay at zero in a healthy run. |
 | `match_idempotent_replays_total` | Matching saw a ride that already had a driver (retry or redelivery). Non-zero is evidence of redelivery being absorbed. |
+| `match_unmatched_published_total{reason}` | `ride.unmatched` events matching published, by `no_drivers` / `match_deadline`. |
+| `assignment_duplicates_total`, `unmatched_duplicates_total` | Redelivered `ride.matched` / `ride.unmatched` events assignment-service recognized and ignored. |
 | `pricing_events_consumed_total` | Handler **attempts**, retries included. Compare with `pricing_events_published_total`. |
 
 ```promql
@@ -234,22 +300,22 @@ rate(match_idempotent_replays_total[1m])
 
 To inspect dead letters, consume the `*.dlq` topic and read the `x-error`
 and `x-original-*` headers. To check what is committed, describe the
-consumer groups `pricing-service`, `matching-service` and
-`assignment-service` with the Kafka CLI: lag should return to zero after a
+consumer groups `pricing-service`, `matching-service`,
+`assignment-service` and `assignment-service-unmatched` with the Kafka CLI: lag should return to zero after a
 clean shutdown and restart.
 
 ---
 
 ## 7. What remains
 
-- **1c — `ride.unmatched`.** Business failures in matching are committed and
-  forgotten.
-- **1e — dedupe in assignment-service.** Duplicates currently double-count
-  metrics.
-- **Rebalance-safe tracker.** Needed before running more than one instance
-  or more than one partition.
-- **Handler panic recovery** into the retry/DLQ path.
-- **Phase 2 throughput work** (multi-partition topics, matcher pool
-  starvation from slow-fail matches).
+- **Full rewind detection.** Re-assignment above the last tracked offset is
+  not recognized (3f).
+- **Phase 2 throughput work.** Multi-partition topics, and the batch-1
+  fail-fast for slow-fail matches in matching. The `MATCH_WORKERS` /
+  `MATCH_DEADLINE` defaults (`NumCPU × 25`, 500 ms) are unmeasured.
+- **Persistent assignment store**, so dedupe survives a restart.
+- **No end-to-end run yet.** The epoch handling, panic path, `ride.unmatched`
+  flow and assignment dedupe are covered by hermetic unit tests only; none of
+  it has been run against real Kafka and Redis.
 - **Benchmark ladder must be re-run.** `tools/benchmark/benchmark-results.csv`
   predates these changes; see the note in the README.

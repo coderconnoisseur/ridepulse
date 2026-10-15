@@ -14,18 +14,33 @@ import (
 	"ridepulse/services/assignment-service/internal/metrics"
 )
 
-const dlqTopic = "ride.matched.dlq"
+const (
+	// Each topic gets its own consumer group. With one shared group, the
+	// group leader's metadata request for both topics fails as a whole while
+	// ride.unmatched does not exist yet (it is created lazily on the first
+	// business failure), leaving both readers without partitions.
+	matchedGroupID   = "assignment-service"
+	unmatchedGroupID = "assignment-service-unmatched"
 
-type KafkaConsumer struct {
-	reader *kafka.Reader
-	dlq    *kafka.Writer
+	matchedTopic      = "ride.matched"
+	matchedDLQTopic   = "ride.matched.dlq"
+	unmatchedTopic    = "ride.unmatched"
+	unmatchedDLQTopic = "ride.unmatched.dlq"
+)
+
+// consumer is the topic-agnostic reader + DLQ writer pair shared by the
+// typed consumers below. Each topic has its own consumer group.
+type consumer struct {
+	reader   *kafka.Reader
+	dlq      *kafka.Writer
+	dlqTopic string
 }
 
-func NewKafkaConsumer(brokers []string) *KafkaConsumer {
+func newConsumer(brokers []string, groupID, topic, dlqTopic string) *consumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers,
-		GroupID: "assignment-service",
-		Topic:   "ride.matched",
+		GroupID: groupID,
+		Topic:   topic,
 		// Commits are issued by the runner after processing; the interval
 		// makes them asynchronous batches instead of one round trip each.
 		CommitInterval: time.Second,
@@ -45,37 +60,69 @@ func NewKafkaConsumer(brokers []string) *KafkaConsumer {
 		// Default batch timeout (1s) would stall every synchronous DLQ write.
 		BatchTimeout: 10 * time.Millisecond,
 	}
-	return &KafkaConsumer{reader: r, dlq: dlq}
+	return &consumer{reader: r, dlq: dlq, dlqTopic: dlqTopic}
 }
 
-// Run consumes RideMatched events until ctx is cancelled, calling handler for
+// run consumes events of type T until ctx is cancelled, calling handler for
 // each. A decode failure is dead-lettered without retries; a handler error is
 // retried and then dead-lettered. Offsets are committed only once a message
 // has been handled or dead-lettered.
-func (c *KafkaConsumer) Run(
+func run[T any](
 	ctx context.Context,
-	handler func(ctx context.Context, event domain.RideMatchedEvent) error,
+	c *consumer,
+	what string,
+	handler func(ctx context.Context, event T) error,
 ) error {
 	cfg := kafkaconsumer.Config{
 		Workers:  4,
 		DLQ:      c.dlq,
-		DLQTopic: dlqTopic,
+		DLQTopic: c.dlqTopic,
 		OnDLQ:    func(kafka.Message, error) { metrics.DLQMessages.Inc() },
 	}
 	return kafkaconsumer.Run(ctx, c.reader, cfg, func(ctx context.Context, msg kafka.Message) error {
-		var event domain.RideMatchedEvent
+		var event T
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			return kafkaconsumer.Permanent(fmt.Errorf("decode RideMatched: %w", err))
+			return kafkaconsumer.Permanent(fmt.Errorf("decode %s: %w", what, err))
 		}
 		return handler(ctx, event)
 	})
 }
 
 // Close closes the reader and the DLQ writer.
-func (c *KafkaConsumer) Close() error {
+func (c *consumer) Close() error {
 	rerr := c.reader.Close()
 	if err := c.dlq.Close(); err != nil {
 		return err
 	}
 	return rerr
+}
+
+// KafkaConsumer consumes ride.matched.
+type KafkaConsumer struct{ *consumer }
+
+func NewKafkaConsumer(brokers []string) *KafkaConsumer {
+	return &KafkaConsumer{newConsumer(brokers, matchedGroupID, matchedTopic, matchedDLQTopic)}
+}
+
+// Run consumes RideMatched events until ctx is cancelled.
+func (c *KafkaConsumer) Run(
+	ctx context.Context,
+	handler func(ctx context.Context, event domain.RideMatchedEvent) error,
+) error {
+	return run(ctx, c.consumer, "RideMatched", handler)
+}
+
+// UnmatchedConsumer consumes ride.unmatched.
+type UnmatchedConsumer struct{ *consumer }
+
+func NewUnmatchedConsumer(brokers []string) *UnmatchedConsumer {
+	return &UnmatchedConsumer{newConsumer(brokers, unmatchedGroupID, unmatchedTopic, unmatchedDLQTopic)}
+}
+
+// Run consumes RideUnmatched events until ctx is cancelled.
+func (c *UnmatchedConsumer) Run(
+	ctx context.Context,
+	handler func(ctx context.Context, event domain.RideUnmatchedEvent) error,
+) error {
+	return run(ctx, c.consumer, "RideUnmatched", handler)
 }

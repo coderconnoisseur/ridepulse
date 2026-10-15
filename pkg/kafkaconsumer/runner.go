@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -56,6 +57,12 @@ type Config struct {
 	OnDLQ func(msg kafka.Message, err error)
 }
 
+// job is a fetched message plus the tracker epoch it was tracked in.
+type job struct {
+	msg   kafka.Message
+	epoch uint64
+}
+
 // runner holds the state shared by the fetch loop and the workers of one Run.
 type runner struct {
 	r       Reader
@@ -97,14 +104,14 @@ func Run(ctx context.Context, r Reader, cfg Config, h Handler) error {
 		stopFetchFn: stopFetch,
 	}
 
-	work := make(chan kafka.Message) // unbuffered: backpressure on fetching
+	work := make(chan job) // unbuffered: backpressure on fetching
 	var wg sync.WaitGroup
 	for range cfg.Workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for msg := range work {
-				rn.process(msg)
+			for j := range work {
+				rn.process(j)
 			}
 		}()
 	}
@@ -163,7 +170,7 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-func (rn *runner) fetchLoop(ctx context.Context, work chan<- kafka.Message) {
+func (rn *runner) fetchLoop(ctx context.Context, work chan<- job) {
 	for {
 		msg, err := rn.r.FetchMessage(ctx)
 		if err != nil {
@@ -172,9 +179,9 @@ func (rn *runner) fetchLoop(ctx context.Context, work chan<- kafka.Message) {
 			}
 			return
 		}
-		rn.tracker.track(msg)
+		epoch := rn.tracker.track(msg)
 		select {
-		case work <- msg:
+		case work <- job{msg, epoch}:
 		case <-ctx.Done():
 			// Tracked but never handed off: it stays pending, which blocks
 			// commits past it, so it is redelivered on restart.
@@ -204,7 +211,8 @@ func (rn *runner) err() error {
 // process drives one message to a terminal state and commits what that
 // unblocks. If the message cannot reach a terminal state (drain timeout, or
 // the DLQ write failed) it is left uncommitted.
-func (rn *runner) process(msg kafka.Message) {
+func (rn *runner) process(j job) {
+	msg := j.msg
 	err := rn.handleWithRetry(msg)
 	if err != nil {
 		if rn.hctx.Err() != nil {
@@ -214,12 +222,12 @@ func (rn *runner) process(msg kafka.Message) {
 			return
 		}
 	}
-	rn.complete(msg)
+	rn.complete(msg, j.epoch)
 }
 
 func (rn *runner) handleWithRetry(msg kafka.Message) error {
 	for attempt := 1; ; attempt++ {
-		err := rn.h(rn.hctx, msg)
+		err := rn.handle(msg)
 		if err == nil || IsPermanent(err) || attempt > rn.cfg.MaxRetries || rn.hctx.Err() != nil {
 			return err
 		}
@@ -230,6 +238,18 @@ func (rn *runner) handleWithRetry(msg kafka.Message) error {
 			return err
 		}
 	}
+}
+
+// handle runs one handler attempt. A panic becomes a permanent error, so the
+// message is dead-lettered instead of crashing the process.
+func (rn *runner) handle(msg kafka.Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("kafkaconsumer: handler panic on %s/%d@%d: %v\n%s", msg.Topic, msg.Partition, msg.Offset, r, debug.Stack())
+			err = Permanent(fmt.Errorf("handler panic: %v", r))
+		}
+	}()
+	return rn.h(rn.hctx, msg)
 }
 
 // deadLetter routes a failed message to the DLQ (or drops it when no DLQ is
@@ -297,13 +317,13 @@ func (rn *runner) sleep(attempt int) bool {
 // complete marks msg terminal and commits the highest offset that became
 // committable. Holding commitMu across done+commit keeps commits serialized
 // and per-partition monotonic: a later done() can only pop higher offsets.
-func (rn *runner) complete(msg kafka.Message) {
+func (rn *runner) complete(msg kafka.Message, epoch uint64) {
 	rn.commitMu.Lock()
 	defer rn.commitMu.Unlock()
 	if rn.stopped {
 		return
 	}
-	toCommit, ok := rn.tracker.done(msg)
+	toCommit, ok := rn.tracker.done(msg, epoch)
 	if !ok {
 		return
 	}
