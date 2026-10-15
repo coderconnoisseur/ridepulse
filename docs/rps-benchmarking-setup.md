@@ -298,7 +298,7 @@ already reflects any shortfall.
 #### Environment variables (all services)
 
 Every service now reads its endpoints from the environment; unset or blank
-values use the defaults. Invalid values make the service exit at startup.
+values use the defaults. Invalid values make the services exit at startup, except rider-simulator, which falls back to the default for a non-numeric or non-positive `RIDER_RPS` / `RIDER_CONCURRENCY`; double-check these when running the ladder.
 
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|

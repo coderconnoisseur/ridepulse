@@ -246,7 +246,7 @@ Prometheus scrape targets:
 
 Confirm all four are `up` at http://localhost:9090/targets.
 
-**Configuration.** Every service reads its endpoints from environment variables; unset or blank values fall back to the defaults below, so the commands above work unchanged on one host. `KAFKA_BROKERS` is a comma-separated list. An invalid value makes the service exit at startup.
+**Configuration.** Every service reads its endpoints from environment variables; unset or blank values fall back to the defaults below, so the commands above work unchanged on one host. `KAFKA_BROKERS` is a comma-separated list. Invalid values make the services exit at startup, except rider-simulator, which falls back to the default for a non-numeric or non-positive `RIDER_RPS` / `RIDER_CONCURRENCY`; double-check these when running the ladder.
 
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
