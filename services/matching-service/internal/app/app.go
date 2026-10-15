@@ -72,7 +72,7 @@ func Run(ctx context.Context) error {
 
 		match, err := matcher.Match(matchCtx, event)
 		if err != nil {
-			if isBusinessFailure(err) {
+			if isBusinessFailure(err, matchCtx.Err()) {
 				// No driver / match deadline is a business outcome, not a
 				// retryable failure: log it and commit the offset.
 				log.Printf("matching failed for ride %s: %v", event.RideID, err)
@@ -113,6 +113,10 @@ func Run(ctx context.Context) error {
 
 // isBusinessFailure reports whether a Match error is a business outcome
 // (commit and move on) rather than an infrastructure failure (retry).
-func isBusinessFailure(err error) bool {
-	return errors.Is(err, matching.ErrNoDriversAvailable) || errors.Is(err, context.DeadlineExceeded)
+// DeadlineExceeded counts only when the outer match deadline expired
+// (matchCtxErr != nil); any other deadline, such as the detached assign
+// timeout or a pool wait, is retried, which is safe via ride:driver replay.
+func isBusinessFailure(err, matchCtxErr error) bool {
+	return errors.Is(err, matching.ErrNoDriversAvailable) ||
+		(errors.Is(err, context.DeadlineExceeded) && matchCtxErr != nil)
 }

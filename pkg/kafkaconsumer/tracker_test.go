@@ -84,3 +84,17 @@ func TestTrackerConcurrentUse(t *testing.T) {
 		t.Fatalf("highest committable offset = %d, want %d", highest, n-1)
 	}
 }
+
+func TestTrackerOffsetRewindResetsPartition(t *testing.T) {
+	tr := newOffsetTracker()
+	for i := int64(0); i < 3; i++ {
+		tr.track(msgAt("t", 0, i))
+	}
+	// Broker rewinds to offset 1: stale state for the partition is dropped.
+	tr.track(msgAt("t", 0, 1))
+
+	got, ok := tr.done(msgAt("t", 0, 1))
+	if !ok || got.Offset != 1 {
+		t.Fatalf("done(1) after rewind = (%d, %v), want (1, true)", got.Offset, ok)
+	}
+}

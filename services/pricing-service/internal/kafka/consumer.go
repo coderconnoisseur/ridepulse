@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"runtime"
 	"time"
 
@@ -29,8 +30,13 @@ func NewKafkaConsumer(brokers []string, groupId, topic string) *KafkaConsumer {
 		// Commits are issued by the runner after processing; the interval
 		// makes them asynchronous batches instead of one round trip each.
 		CommitInterval: time.Second,
-		MinBytes:       1,
-		MaxBytes:       10e6,
+		// With interval commits CommitMessages only queues; real commit errors
+		// surface here and would otherwise be dropped silently.
+		ErrorLogger: kafka.LoggerFunc(func(format string, args ...interface{}) {
+			log.Printf("pricing-service kafka: "+format, args...)
+		}),
+		MinBytes: 1,
+		MaxBytes: 10e6,
 	})
 	// No fixed Topic: the runner sets the topic on each DLQ message.
 	dlq := &kafka.Writer{
@@ -39,6 +45,8 @@ func NewKafkaConsumer(brokers []string, groupId, topic string) *KafkaConsumer {
 		RequiredAcks: kafka.RequireOne,
 		// DLQ topics are not provisioned elsewhere; create on first write.
 		AllowAutoTopicCreation: true,
+		// Default batch timeout (1s) would stall every synchronous DLQ write.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	return &KafkaConsumer{reader: reader, dlq: dlq}
 }
