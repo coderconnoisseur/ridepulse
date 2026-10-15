@@ -9,16 +9,19 @@
 
 ## 1. The bug in one paragraph
 
-All three consumers (pricing, matching, assignment) read with a consumer
-group and the default `ReadMessage` behaviour: the offset is committed as
-soon as the message is *fetched*, before the handler has run. If the
-handler failed, the message was logged and lost; if the process was killed
-mid-handler, every in-flight message was lost with it. Worker pools made it
-worse: the code had no notion of "which messages are actually finished", so
-there was no safe offset to commit even if it had wanted to. The result was
-at-most-once delivery with silent drops, which is the wrong default for a
-pipeline whose only success signal is "the ride eventually shows up in
-assignment-service".
+All three consumers (pricing, matching, assignment) used
+`FetchMessage` plus an explicit `CommitMessages`, but the handling around
+them lost messages in two ways. First, the handler was a worker-pool
+`Enqueue`/`Submit` that returned `nil` as soon as the event was buffered, so
+the offset was committed *before* processing: a crash lost everything
+buffered or in flight, and a handler that later failed was only logged.
+Second, on the synchronous path a failing handler hit `continue` without
+committing, but the next message that did succeed committed a later offset,
+which implicitly covers the skipped one, so the "retry" never happened. The
+code also had no notion of which messages were actually finished, so there
+was no safe offset to commit. The result was at-most-once delivery with
+silent drops, which is the wrong default for a pipeline whose only success
+signal is "the ride eventually shows up in assignment-service".
 
 ---
 
@@ -31,7 +34,7 @@ Three things were conflated:
 3. **Committing** it (a promise to the broker that it never needs to be
    delivered again).
 
-Committing on fetch makes (3) happen before (2). Committing on handler
+Committing when work is merely enqueued makes (3) happen before (2). Committing on handler
 completion from a worker pool is also wrong on its own: workers finish out
 of order, and a Kafka commit is a single number per partition ("everything
 below this offset is done"). Committing offset 10 because message 10
@@ -107,7 +110,8 @@ and appends four more:
 That is enough to replay a record by hand (strip the `x-*` headers, publish
 the value back to the original topic) and to find the exact source record.
 
-The DLQ writers set `AllowAutoTopicCreation: true`, because the DLQ topics
+The DLQ writers set `BatchTimeout: 10ms` (the 1 s default would make every
+synchronous DLQ write wait about a second) and `AllowAutoTopicCreation: true`, because the DLQ topics
 are not provisioned anywhere else; the first dead-lettered message creates
 the topic. The runner sets `Topic` on each DLQ message, so the writer itself
 has no fixed topic.
@@ -132,16 +136,23 @@ On SIGINT/SIGTERM the service context is cancelled. Then:
    redelivered. A "drain timeout ... leaving in-flight messages
    uncommitted" line is logged.
 
-`Run` never closes the reader or the DLQ writer; each service's `app.Run`
-closes them after `Run` returns, then stops its HTTP server. Fatal errors
-(a fetch error not caused by shutdown, a commit error, a DLQ write failure)
-take the same drain path and are returned to `main`.
+`Run` never closes the reader or the DLQ writer. After the runner drains,
+each service's `app.Run` shuts down its HTTP server, then closes the reader,
+the DLQ writer and the publisher (matching also closes Redis). Fatal errors
+(a fetch error not caused by shutdown, a synchronous commit error, a DLQ
+write failure) take the same drain path and are returned to `main`.
 
 ### 3e. Reader settings
 
 All three readers use `CommitInterval: 1s`. `CommitMessages` therefore
 queues the offset and a background loop flushes it once a second, instead
-of paying one broker round trip per message. The cost: after a crash, up to
+of paying one broker round trip per message. With an interval,
+`CommitMessages` does not return commit errors; kafka-go reports them
+through `ReaderConfig.ErrorLogger` and retries the pending offset on the
+next tick. All three readers set `ErrorLogger` to the standard logger
+(prefixed with the service name) so failed commits are visible. The runner's
+fatal-commit path therefore only applies to synchronous commits (interval
+0). The cost: after a crash, up to
 about one second of already-handled messages can be redelivered on top of
 the in-flight ones. That is within the at-least-once contract, and it is
 why the handlers have to tolerate duplicates (section 5).
@@ -158,11 +169,12 @@ why the handlers have to tolerate duplicates (section 5).
 
 **Matching** splits `Match` errors in `app.go`:
 
-- `ErrNoDriversAvailable` and `context.DeadlineExceeded` are business
-  failures. The handler logs, returns `nil`, and the offset is committed.
+- `ErrNoDriversAvailable`, and `context.DeadlineExceeded` when it is the
+  outer match deadline (`matchCtx.Err() != nil`), are business failures. The handler logs, returns `nil`, and the offset is committed.
   The ride is currently dropped: nothing tells the rider or downstream
   systems. Emitting a `ride.unmatched` event is roadmap item 1c.
-- Any other `Match` error (Redis failures) is returned, so the runner
+- Any other `Match` error (Redis failures, and any other
+  `DeadlineExceeded` such as the detached assign timeout) is returned, so the runner
   retries it and eventually dead-letters it. Retrying is safe because
   `Match` replays an existing assignment instead of matching again
   (see [driver-state-model.md](driver-state-model.md)).
@@ -191,7 +203,10 @@ why the handlers have to tolerate duplicates (section 5).
 - **Partition rebalances are not handled by the tracker.** It assumes one
   assigned partition set for the life of the process. If a rebalance moved a
   partition away and back, the broker may rewind to a lower offset than the
-  tracker has seen, and the tracker would mis-order. The topics are
+  tracker has seen, and the tracker would mis-order. As a guard, `track`
+detects an offset at or below the last tracked one for a partition, logs it
+and resets that partition's state, so the watermark cannot wedge; this is a
+mitigation, not a rebalance-safe design. The topics are
   single-partition and each service runs as a single instance today, so this
   cannot happen yet; it must be revisited before the Phase 2 multi-partition
   work.

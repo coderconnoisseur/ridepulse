@@ -115,7 +115,7 @@ Full write-up: [driver-state-model.md](docs/driver-state-model.md).
 
 ### 7. Worker Pool with Bounded Concurrency
 
-A CPU-aware worker pool sits between Kafka consumption and matching logic. This provides natural backpressure — if matching falls behind, the pool queue fills rather than spawning unbounded goroutines, preventing memory blowup under load spikes.
+The shared consumer runner (`pkg/kafkaconsumer`) hands each fetched message to a fixed number of workers over an unbuffered channel. This provides natural backpressure — if handlers fall behind, fetching blocks rather than spawning unbounded goroutines or buffering messages, preventing memory blowup under load spikes.
 
 ### 8. Observability-Driven Tuning
 

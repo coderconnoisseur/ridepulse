@@ -485,8 +485,8 @@ of scope for the "can we measure at all?" pass:
   explicitly create topics with `partitions=8` (or so) in a bootstrap
   step in `docker-compose.yml`, and run multiple matching-service /
   pricing-service instances.
-- **Env-var config**. Every host is still hardcoded (`localhost:9092`,
-  `localhost:6379`, etc.). Fine for a single-host benchmark; blocks
+- **Env-var config**. Most hosts are still hardcoded (`localhost:9092`,
+  `localhost:6379`, etc.; driver-simulator now reads `REDIS_ADDR`). Fine for a single-host benchmark; blocks
   running any service on a different box.
 - ~~Graceful shutdown~~, ~~silent-drop consumer retries~~ and
   ~~match-failed vs publish-failed~~ are addressed by the shared consumer

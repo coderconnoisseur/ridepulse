@@ -121,7 +121,10 @@ bounds waiting for a pooled connection, not the socket read or write; socket
 I/O falls back to the client's own default timeouts (3 s read). The detached
 200 ms is therefore a best-effort bound, not a hard one, and a stalled
 Redis can hold a match handler for up to that longer socket timeout. If
-that matters, enable `ContextTimeoutEnabled` on the client.
+that matters, enable `ContextTimeoutEnabled` on the client. The handler's
+error classification is what makes that safe: only the outer match deadline
+(`matchCtx.Err() != nil`) is treated as a business failure; any other
+`DeadlineExceeded` is retried, and the retry replays through `ride:driver`.
 
 ### Error handling around it
 
