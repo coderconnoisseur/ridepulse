@@ -22,3 +22,7 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
+
+require ridepulse/pkg v0.0.0
+
+replace ridepulse/pkg => ../../pkg

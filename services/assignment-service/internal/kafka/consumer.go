@@ -3,14 +3,21 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 
+	"ridepulse/pkg/kafkaconsumer"
 	"ridepulse/services/assignment-service/internal/domain"
+	"ridepulse/services/assignment-service/internal/metrics"
 )
+
+const dlqTopic = "ride.matched.dlq"
 
 type KafkaConsumer struct {
 	reader *kafka.Reader
+	dlq    *kafka.Writer
 }
 
 func NewKafkaConsumer(brokers []string) *KafkaConsumer {
@@ -18,34 +25,47 @@ func NewKafkaConsumer(brokers []string) *KafkaConsumer {
 		Brokers: brokers,
 		GroupID: "assignment-service",
 		Topic:   "ride.matched",
+		// Commits are issued by the runner after processing; the interval
+		// makes them asynchronous batches instead of one round trip each.
+		CommitInterval: time.Second,
 	})
-	return &KafkaConsumer{reader: r}
+	// No fixed Topic: the runner sets the topic on each DLQ message.
+	dlq := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: kafka.RequireOne,
+	}
+	return &KafkaConsumer{reader: r, dlq: dlq}
 }
 
-func (c *KafkaConsumer) ConsumeRideMatched(
-	handler func(event domain.RideMatchedEvent) error,
+// Run consumes RideMatched events until ctx is cancelled, calling handler for
+// each. A decode failure is dead-lettered without retries; a handler error is
+// retried and then dead-lettered. Offsets are committed only once a message
+// has been handled or dead-lettered.
+func (c *KafkaConsumer) Run(
+	ctx context.Context,
+	handler func(ctx context.Context, event domain.RideMatchedEvent) error,
 ) error {
-	for {
-		msg, err := c.reader.FetchMessage(context.Background())
-		if err != nil {
-			return err
-		}
+	cfg := kafkaconsumer.Config{
+		Workers:  4,
+		DLQ:      c.dlq,
+		DLQTopic: dlqTopic,
+		OnDLQ:    func(kafka.Message, error) { metrics.DLQMessages.Inc() },
+	}
+	return kafkaconsumer.Run(ctx, c.reader, cfg, func(ctx context.Context, msg kafka.Message) error {
 		var event domain.RideMatchedEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			// Malformed message → commit and move on so we don't block the topic.
-			_ = c.reader.CommitMessages(context.Background(), msg)
-			continue
+			return kafkaconsumer.Permanent(fmt.Errorf("decode RideMatched: %w", err))
 		}
-		if err := handler(event); err != nil {
-			// Match the pattern used in pricing- and matching-service consumers
-			// (silent skip on handler error). Documented as a broader follow-up
-			// in the benchmarking runbook — kept consistent for now so behaviour
-			// is uniform across the fleet during load tests.
-			_ = c.reader.CommitMessages(context.Background(), msg)
-			continue
-		}
-		if err := c.reader.CommitMessages(context.Background(), msg); err != nil {
-			return err
-		}
+		return handler(ctx, event)
+	})
+}
+
+// Close closes the reader and the DLQ writer.
+func (c *KafkaConsumer) Close() error {
+	rerr := c.reader.Close()
+	if err := c.dlq.Close(); err != nil {
+		return err
 	}
+	return rerr
 }

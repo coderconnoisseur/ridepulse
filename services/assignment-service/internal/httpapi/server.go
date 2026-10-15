@@ -3,7 +3,6 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -13,26 +12,24 @@ import (
 	"ridepulse/services/assignment-service/internal/store"
 )
 
-// Serve starts the metrics + assignment-query HTTP server. Blocks until the
-// server exits. Endpoints:
+// NewServer builds the metrics + assignment-query HTTP server. The caller
+// starts it with ListenAndServe and stops it with Shutdown. Endpoints:
 //
 //	GET /metrics                 — Prometheus scrape endpoint
 //	GET /assignments/<rideID>    — look up a single assignment (JSON)
 //	GET /count                   — total assignments stored (plaintext)
-func Serve(addr string, mem *store.Memory) error {
+func NewServer(addr string, mem *store.Memory) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/assignments/", queryHandler(mem))
 	mux.HandleFunc("/count", countHandler(mem))
 
-	server := &http.Server{
+	return &http.Server{
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
-	log.Printf("assignment-service listening on %s", addr)
-	return server.ListenAndServe()
 }
 
 func queryHandler(mem *store.Memory) http.HandlerFunc {

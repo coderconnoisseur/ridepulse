@@ -24,6 +24,11 @@ var (
 		Name: "assignment_missing_requested_at_total",
 		Help: "Matched events with no RequestedAt timestamp (indicates upstream schema drift).",
 	})
+
+	DLQMessages = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "assignment_dlq_messages_total",
+		Help: "Messages routed to the dead-letter topic.",
+	})
 )
 
 func Register() {
@@ -31,5 +36,6 @@ func Register() {
 		AssignmentsTotal,
 		EndToEndLatency,
 		MissingRequestedAt,
+		DLQMessages,
 	)
 }
