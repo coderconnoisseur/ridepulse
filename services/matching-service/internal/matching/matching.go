@@ -82,6 +82,16 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		metrics.MatchLatency.Observe(time.Since(start).Seconds())
 	}()
 
+	// Idempotent replay: a retry or redelivery of a ride that already has a
+	// driver must return that driver, never lock and assign a second one.
+	if driverID, found, err := s.repo.GetRideDriver(ctx, event.RideID); err != nil {
+		metrics.MatchFailures.Inc()
+		return domain.RideMatchedEvent{}, err
+	} else if found {
+		metrics.MatchIdempotentReplays.Inc()
+		return matchedEvent(event, driverID), nil
+	}
+
 	drivers, err := s.repo.FindNearbyDrivers(ctx, event.Pickup.Lat, event.Pickup.Lng, 50)
 	if err != nil {
 		metrics.MatchFailures.Inc()
@@ -129,19 +139,38 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		batch := drivers[i:end]
 
 		winnerID, ok := s.tryLockBatch(ctx, batch, event.RideID)
-		if ok {
-			metrics.MatchSuccess.Inc()
-			return domain.RideMatchedEvent{
-				RideID:      event.RideID,
-				DriverID:    winnerID,
-				MatchedAT:   time.Now().Unix(),
-				RequestedAt: event.RequestedAt,
-			}, nil
+		if !ok {
+			continue
 		}
+
+		// The returned driver may differ from winnerID if a concurrent
+		// attempt for the same ride assigned first; our lock is then freed.
+		assignedID, err := s.repo.AssignDriver(ctx, winnerID, event.RideID)
+		if errors.Is(err, ports.ErrLockLost) {
+			// Lock expired between SETNX and assign; it is no longer ours
+			// to release. Try the next batch.
+			continue
+		}
+		if err != nil {
+			s.releaseLock(winnerID, event.RideID)
+			metrics.MatchFailures.Inc()
+			return domain.RideMatchedEvent{}, err
+		}
+		metrics.MatchSuccess.Inc()
+		return matchedEvent(event, assignedID), nil
 	}
 
 	metrics.MatchFailures.Inc()
 	return domain.RideMatchedEvent{}, errors.New("no drivers available")
+}
+
+func matchedEvent(event domain.RidePricedEvent, driverID string) domain.RideMatchedEvent {
+	return domain.RideMatchedEvent{
+		RideID:      event.RideID,
+		DriverID:    driverID,
+		MatchedAT:   time.Now().Unix(),
+		RequestedAt: event.RequestedAt,
+	}
 }
 
 // tryLockBatch races SETNX across the whole batch, picks the first successful
