@@ -5,7 +5,7 @@ import "github.com/prometheus/client_golang/prometheus"
 var (
 	EventsConsumed = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "pricing_events_consumed_total",
-		Help: "Total RideRequested events consumed from Kafka.",
+		Help: "RideRequested handler attempts; pricing_retries_total counts the retries among them.",
 	})
 
 	EventsPublished = prometheus.NewCounter(prometheus.CounterOpts{
@@ -16,6 +16,16 @@ var (
 	PublishErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "pricing_publish_errors_total",
 		Help: "RidePriced publish failures.",
+	})
+
+	Retries = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "pricing_retries_total",
+		Help: "Handler attempts that failed and were retried.",
+	})
+
+	DLQMessages = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "pricing_dlq_messages_total",
+		Help: "Messages routed to the dead-letter topic.",
 	})
 
 	ProcessingDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -30,6 +40,8 @@ func Register() {
 		EventsConsumed,
 		EventsPublished,
 		PublishErrors,
+		Retries,
+		DLQMessages,
 		ProcessingDuration,
 	)
 }
