@@ -98,3 +98,8 @@ func (r *DriverRepository) UnlockDriver(
 	}
 	return err
 }
+
+// Close closes the underlying Redis client.
+func (r *DriverRepository) Close() error {
+	return r.client.Close()
+}

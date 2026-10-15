@@ -93,6 +93,20 @@ var (
 		},
 	)
 
+	Retries = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "matching_retries_total",
+			Help: "Handler attempts that failed and were retried.",
+		},
+	)
+
+	DLQMessages = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "matching_dlq_messages_total",
+			Help: "Messages routed to the dead-letter topic.",
+		},
+	)
+
 	Goroutines = prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "goroutine_count",
@@ -112,6 +126,8 @@ func Register() {
 		MatchLatency,
 		NearbyDrivers,
 		Goroutines,
+		Retries,
+		DLQMessages,
 		RedisGeoLatency,
 		NearbyDriversGauge,
 		DriverLockLatency,
