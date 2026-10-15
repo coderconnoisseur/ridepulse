@@ -112,7 +112,7 @@ match again. Consumer lag is nowhere near that today.
 
 `AssignDriver` runs on a context detached from the match deadline
 (`context.WithoutCancel`, then a 200 ms timeout). Without that, a match
-that spent most of its 800 ms budget could have the assign cut off and the
+that spent most of its match budget (`MATCH_DEADLINE`, default 500 ms) could have the assign cut off and the
 caller would believe the ride failed while Redis might have assigned it.
 
 Be honest about what the 200 ms bounds: the go-redis client is built with
@@ -133,9 +133,48 @@ error classification is what makes that safe: only the outer match deadline
   failure and return the error. matching-service's handler returns it, so
   the runner retries; the retry replays via the record if the assign had in
   fact landed.
-- `ErrNoDriversAvailable` / `context.DeadlineExceeded` → business failure
-  (offset committed, ride currently dropped; `ride.unmatched` is roadmap
-  item 1c).
+- `ErrNoDriversAvailable` / `context.DeadlineExceeded` (outer match
+  deadline) → business failure: matching publishes `ride.unmatched` and
+  commits the offset (section 4b).
+
+### 4b. The unmatched path
+
+When matching ends without a driver, the handler publishes a
+`ride.unmatched` event instead of dropping the ride:
+
+| Field | Meaning |
+|---|---|
+| `RideID` | The ride (also the Kafka key). |
+| `Reason` | `no_drivers` (`ErrNoDriversAvailable`) or `match_deadline` (the outer match deadline expired). |
+| `RequestedAt` | UnixNano stamp from the gateway, carried through for latency. |
+| `FailedAt` | UnixNano time the failure was decided. |
+
+Publishing has its own 300 ms budget, separate from the match deadline. If
+the publish fails the handler returns the error, the runner retries it and
+eventually dead-letters the `ride.priced` message, as for any other
+infrastructure failure; the offset is committed only after the event is out.
+`match_unmatched_published_total{reason}` counts successful publishes. The
+writer is created with `AllowAutoTopicCreation`, so the first unmatched ride
+creates the topic; assignment-service dead-letters undecodable events to
+`ride.unmatched.dlq`.
+
+An unmatched ride writes no Redis state: no `ride:driver` record, no assigned
+key, nothing locked (phantom locks are released as usual). That has two
+consequences:
+
+- A redelivered `ride.priced` for an unmatched ride runs `Match` again, and
+  may now succeed if drivers have been released in the meantime. The ride
+  can then produce `ride.matched` after `ride.unmatched`.
+- assignment-service therefore treats matched as final: `ride.matched`
+  replaces an earlier unmatched record, a later `ride.unmatched` for a
+  matched ride is ignored (`unmatched_duplicates_total`), and so is a second
+  `ride.unmatched` for the same ride. `GET /rides/<id>` on
+  assignment-service reports whichever outcome is current.
+
+assignment-service counts unmatched rides in `unmatched_total{reason}` and
+`unmatched_end_to_end_latency_seconds`, separately from `assignments_total`
+and `end_to_end_latency_seconds`, which now count each matched ride once
+(redeliveries go to `assignment_duplicates_total`).
 
 ---
 
@@ -191,12 +230,13 @@ should be about `DRIVER_COUNT` (locked drivers are still in the set).
 
 ## 7. What remains
 
-- **1c — `ride.unmatched`** for rides that find no driver.
-- **1e — dedupe in assignment-service**, so a replayed `ride.matched` does
-  not double-count.
+- **Persistent outcome store.** assignment-service dedupes in memory, so a
+  restart forgets which rides it has seen.
 - **Phase 2 throughput work.** With drivers now busy for the trip duration,
   the saturation point of the ladder moves; the supply model is also a new
   tuning dimension (`DRIVER_COUNT` against `DRIVER_TRIP_DURATION`).
 - **Hard Redis time bounds** (`ContextTimeoutEnabled`), see section 4.
 - **Benchmark ladder must be re-run** before any number is compared with the
-  committed CSV.
+  committed CSV. The matcher defaults (`MATCH_WORKERS` = `NumCPU × 25`,
+  `MATCH_DEADLINE` = 500 ms) are unmeasured, and the unmatched path has not
+  been exercised against real Kafka and Redis.
