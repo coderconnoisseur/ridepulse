@@ -66,32 +66,7 @@ func Run(ctx context.Context, cfg Config) error {
 	consumer := kafka.NewKafkaConsumer(cfg.KafkaBrokers, cfg.MatchWorkers)
 	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
-	runErr := consumer.Run(ctx, func(ctx context.Context, event domain.RidePricedEvent) error {
-		matchCtx, matchCancel := context.WithTimeout(ctx, cfg.MatchDeadline)
-		defer matchCancel()
-
-		match, err := matcher.Match(matchCtx, event)
-		if err != nil {
-			if isBusinessFailure(err, matchCtx.Err()) {
-				// No driver / match deadline is a business outcome, not a
-				// retryable failure: log it and commit the offset.
-				log.Printf("matching failed for ride %s: %v", event.RideID, err)
-				return nil
-			}
-			// Redis/infra error: return it so the runner retries (and then
-			// dead-letters). Retries are safe: Match replays an existing
-			// assignment via ride:driver instead of matching again.
-			return err
-		}
-
-		// Publish gets its OWN budget derived from the handler ctx, not from
-		// matchCtx. A match that used most of the match deadline must not starve
-		// the Kafka write of its round-trip budget. A publish failure is
-		// returned so the message is retried and then dead-lettered.
-		publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
-		defer publishCancel()
-		return publisher.PublishRideMatched(publishCtx, match)
-	})
+	runErr := consumer.Run(ctx, newHandler(matcher, publisher, cfg.MatchDeadline))
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -119,4 +94,69 @@ func Run(ctx context.Context, cfg Config) error {
 func isBusinessFailure(err, matchCtxErr error) bool {
 	return errors.Is(err, matching.ErrNoDriversAvailable) ||
 		(errors.Is(err, context.DeadlineExceeded) && matchCtxErr != nil)
+}
+
+// matcherAPI and eventPublisher are the handler's collaborators, narrowed so
+// the handler can be tested with fakes.
+type matcherAPI interface {
+	Match(ctx context.Context, event domain.RidePricedEvent) (domain.RideMatchedEvent, error)
+}
+
+type eventPublisher interface {
+	PublishRideMatched(ctx context.Context, event domain.RideMatchedEvent) error
+	PublishRideUnmatched(ctx context.Context, event domain.RideUnmatchedEvent) error
+}
+
+// newHandler builds the per-ride handler: match, then publish ride.matched,
+// or on a business failure publish ride.unmatched so the rider is told.
+func newHandler(matcher matcherAPI, publisher eventPublisher, matchDeadline time.Duration) func(context.Context, domain.RidePricedEvent) error {
+	return func(ctx context.Context, event domain.RidePricedEvent) error {
+		matchCtx, matchCancel := context.WithTimeout(ctx, matchDeadline)
+		defer matchCancel()
+
+		match, err := matcher.Match(matchCtx, event)
+		if err != nil {
+			if isBusinessFailure(err, matchCtx.Err()) {
+				// No driver / match deadline is a business outcome, not a
+				// retryable failure: log it, tell the rider, commit the offset.
+				log.Printf("matching failed for ride %s: %v", event.RideID, err)
+				reason := unmatchedReason(err)
+				publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
+				defer publishCancel()
+				// A publish failure is returned so the runner retries it.
+				if perr := publisher.PublishRideUnmatched(publishCtx, domain.RideUnmatchedEvent{
+					RideID:      event.RideID,
+					Reason:      reason,
+					RequestedAt: event.RequestedAt,
+					FailedAt:    time.Now().UnixNano(),
+				}); perr != nil {
+					return perr
+				}
+				metrics.MatchUnmatchedPublished.WithLabelValues(reason).Inc()
+				return nil
+			}
+			// Redis/infra error: return it so the runner retries (and then
+			// dead-letters). Retries are safe: Match replays an existing
+			// assignment via ride:driver instead of matching again.
+			return err
+		}
+
+		// Publish gets its OWN budget derived from the handler ctx, not from
+		// matchCtx. A match that used most of the match deadline must not starve
+		// the Kafka write of its round-trip budget. A publish failure is
+		// returned so the message is retried and then dead-lettered.
+		publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
+		defer publishCancel()
+		return publisher.PublishRideMatched(publishCtx, match)
+	}
+}
+
+// unmatchedReason maps a business-failure error to the ride.unmatched reason.
+// Mirrors isBusinessFailure: anything that is not ErrNoDriversAvailable is the
+// outer match deadline.
+func unmatchedReason(err error) string {
+	if errors.Is(err, matching.ErrNoDriversAvailable) {
+		return "no_drivers"
+	}
+	return "match_deadline"
 }
