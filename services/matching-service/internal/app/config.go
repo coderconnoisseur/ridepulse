@@ -16,6 +16,7 @@ type Config struct {
 	KafkaBrokers  []string
 	RedisAddr     string
 	MatchWorkers  int
+	RedisPoolSize int
 	MatchDeadline time.Duration
 }
 
@@ -31,6 +32,15 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		workers, err = strconv.Atoi(raw)
 		if err != nil || workers <= 0 {
 			return Config{}, fmt.Errorf("MATCH_WORKERS %q must be a positive integer", raw)
+		}
+	}
+
+	// Each worker runs up to BatchSize parallel SETNX attempts.
+	poolSize := workers * matching.BatchSize
+	if raw := strings.TrimSpace(getenv("REDIS_POOL_SIZE")); raw != "" {
+		poolSize, err = strconv.Atoi(raw)
+		if err != nil || poolSize <= 0 {
+			return Config{}, fmt.Errorf("REDIS_POOL_SIZE %q must be a positive integer", raw)
 		}
 	}
 
@@ -50,6 +60,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		KafkaBrokers:  brokers,
 		RedisAddr:     envOr(getenv, "REDIS_ADDR", "localhost:6379"),
 		MatchWorkers:  workers,
+		RedisPoolSize: poolSize,
 		MatchDeadline: deadline,
 	}, nil
 }

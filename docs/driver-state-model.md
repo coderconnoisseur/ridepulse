@@ -124,7 +124,8 @@ Redis can hold a match handler for up to that longer socket timeout. If
 that matters, enable `ContextTimeoutEnabled` on the client. The handler's
 error classification is what makes that safe: only the outer match deadline
 (`matchCtx.Err() != nil`) is treated as a business failure; any other
-`DeadlineExceeded` is retried, and the retry replays through `ride:driver`.
+`DeadlineExceeded`, and any assign error (`matching.ErrAssign`, even if the
+outer deadline has expired), is retried, and the retry replays through `ride:driver`.
 
 ### Error handling around it
 

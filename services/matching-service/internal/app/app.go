@@ -60,7 +60,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 
 	// --- Dependencies ---
-	driverRepo := redis.NewDriverRepository(cfg.RedisAddr)
+	driverRepo := redis.NewDriverRepository(cfg.RedisAddr, cfg.RedisPoolSize)
 	matcher := matching.New(driverRepo)
 
 	consumer := kafka.NewKafkaConsumer(cfg.KafkaBrokers, cfg.MatchWorkers)
@@ -91,7 +91,12 @@ func Run(ctx context.Context, cfg Config) error {
 // DeadlineExceeded counts only when the outer match deadline expired
 // (matchCtxErr != nil); any other deadline, such as the detached assign
 // timeout or a pool wait, is retried, which is safe via ride:driver replay.
+// An AssignDriver failure (matching.ErrAssign) is always retried, even if the
+// outer deadline has since expired.
 func isBusinessFailure(err, matchCtxErr error) bool {
+	if errors.Is(err, matching.ErrAssign) {
+		return false
+	}
 	return errors.Is(err, matching.ErrNoDriversAvailable) ||
 		(errors.Is(err, context.DeadlineExceeded) && matchCtxErr != nil)
 }

@@ -24,6 +24,7 @@ func TestIsBusinessFailure(t *testing.T) {
 		{"inner deadline, match ctx alive", context.DeadlineExceeded, nil, false},
 		{"redis error", errors.New("dial tcp: connection refused"), nil, false},
 		{"canceled", context.Canceled, nil, false},
+		{"assign timeout after outer deadline", fmt.Errorf("%w: %w", matching.ErrAssign, context.DeadlineExceeded), context.DeadlineExceeded, false},
 	}
 	for _, tc := range cases {
 		if got := isBusinessFailure(tc.err, tc.ctx); got != tc.want {

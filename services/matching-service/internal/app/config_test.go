@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"ridepulse/services/matching-service/internal/matching"
 )
 
 func env(m map[string]string) func(string) string {
@@ -17,6 +19,7 @@ func TestLoadConfig(t *testing.T) {
 		KafkaBrokers:  []string{"localhost:9092"},
 		RedisAddr:     "localhost:6379",
 		MatchWorkers:  runtime.NumCPU() * 25,
+		RedisPoolSize: runtime.NumCPU() * 25 * matching.BatchSize,
 		MatchDeadline: 500 * time.Millisecond,
 	}
 	tests := []struct {
@@ -31,8 +34,15 @@ func TestLoadConfig(t *testing.T) {
 			"MATCH_WORKERS": "7", "MATCH_DEADLINE": "1s",
 		}, Config{
 			MetricsAddr: ":9", KafkaBrokers: []string{"a:1", "b:2"}, RedisAddr: "r:6",
-			MatchWorkers: 7, MatchDeadline: time.Second,
+			MatchWorkers: 7, RedisPoolSize: 7 * matching.BatchSize, MatchDeadline: time.Second,
 		}, false},
+		{"pool size override", map[string]string{"REDIS_POOL_SIZE": "42"},
+			func() Config { c := defaults; c.RedisPoolSize = 42; return c }(), false},
+		{"pool size follows workers", map[string]string{"MATCH_WORKERS": "3"},
+			func() Config { c := defaults; c.MatchWorkers = 3; c.RedisPoolSize = 3 * matching.BatchSize; return c }(), false},
+		{"pool size zero", map[string]string{"REDIS_POOL_SIZE": "0"}, Config{}, true},
+		{"pool size negative", map[string]string{"REDIS_POOL_SIZE": "-1"}, Config{}, true},
+		{"pool size not a number", map[string]string{"REDIS_POOL_SIZE": "big"}, Config{}, true},
 		{"empty broker entry", map[string]string{"KAFKA_BROKERS": "a:1,,b:2"}, Config{}, true},
 		{"workers zero", map[string]string{"MATCH_WORKERS": "0"}, Config{}, true},
 		{"workers negative", map[string]string{"MATCH_WORKERS": "-3"}, Config{}, true},

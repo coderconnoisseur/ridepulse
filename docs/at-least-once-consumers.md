@@ -236,9 +236,11 @@ error.
   returned, so the runner retries and eventually dead-letters it like any
   other infrastructure error. See
   [driver-state-model.md](driver-state-model.md#4b-the-unmatched-path).
-- Any other `Match` error (Redis failures, and any other
-  `DeadlineExceeded` such as the detached assign timeout) is returned, so the runner
-  retries it and eventually dead-letters it. Retrying is safe because
+- Any other `Match` error is returned. That covers
+  Redis failures, any `DeadlineExceeded` that is not the outer match deadline,
+  and every `AssignDriver` failure (wrapped in `matching.ErrAssign`, such as
+  the detached assign timeout), which is retried even if the outer deadline
+  has expired by then. The runner retries and eventually dead-letters these. Retrying is safe because
   `Match` replays an existing assignment instead of matching again
   (see [driver-state-model.md](driver-state-model.md)).
 - Publishing `ride.matched` has its own 300 ms budget; a publish failure is

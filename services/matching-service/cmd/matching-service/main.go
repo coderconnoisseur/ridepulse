@@ -18,7 +18,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("matching-service: invalid configuration: %v", err)
 	}
-	log.Printf("matching-service config: metrics=%s brokers=%v redis=%s workers=%d deadline=%s", cfg.MetricsAddr, cfg.KafkaBrokers, cfg.RedisAddr, cfg.MatchWorkers, cfg.MatchDeadline)
+	log.Printf("matching-service config: metrics=%s brokers=%v redis=%s workers=%d redis_pool=%d deadline=%s", cfg.MetricsAddr, cfg.KafkaBrokers, cfg.RedisAddr, cfg.MatchWorkers, cfg.RedisPoolSize, cfg.MatchDeadline)
 
 	if err := app.Run(ctx, cfg); err != nil {
 		stop()
