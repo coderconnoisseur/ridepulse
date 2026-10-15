@@ -35,6 +35,8 @@ func NewKafkaConsumer(brokers []string) *KafkaConsumer {
 		Addr:         kafka.TCP(brokers...),
 		Balancer:     &kafka.Hash{},
 		RequiredAcks: kafka.RequireOne,
+		// DLQ topics are not provisioned elsewhere; create on first write.
+		AllowAutoTopicCreation: true,
 	}
 	return &KafkaConsumer{reader: r, dlq: dlq}
 }

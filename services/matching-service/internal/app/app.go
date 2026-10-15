@@ -2,17 +2,18 @@ package app
 
 import (
 	"context"
-	"log"
 	"errors"
+	"log"
+	"net/http"
 	"time"
 
-	"ridepulse/services/matching-service/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"ridepulse/services/matching-service/internal/domain"
 	"ridepulse/services/matching-service/internal/kafka"
 	"ridepulse/services/matching-service/internal/matching"
+	"ridepulse/services/matching-service/internal/metrics"
 	"ridepulse/services/matching-service/internal/redis"
-	"net/http"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Deadlines for the per-ride processing pipeline.

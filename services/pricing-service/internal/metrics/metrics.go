@@ -30,7 +30,7 @@ var (
 
 	ProcessingDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "pricing_processing_duration_seconds",
-		Help:    "Time from picking a RideRequested off the pool to publishing the RidePriced event.",
+		Help:    "Time to price and publish one RideRequested handler attempt (observed per attempt, retries included).",
 		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
 	})
 )
