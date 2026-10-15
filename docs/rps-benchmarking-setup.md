@@ -49,7 +49,8 @@ correctness during a benchmark:
   with the unmatched path, below), or 404.
 
 > **Update.** assignment-service now also consumes `ride.unmatched` (second
-> reader, same consumer group), records each ride's outcome once and ignores
+> reader, own consumer group `assignment-service-unmatched`, so a not-yet-created
+> topic only delays that reader), records each ride's outcome once and ignores
 > duplicates. `assignments_total` and `end_to_end_latency_seconds` count each
 > matched ride once; redeliveries go to `assignment_duplicates_total`.
 > Unmatched rides are counted in `unmatched_total{reason}` and

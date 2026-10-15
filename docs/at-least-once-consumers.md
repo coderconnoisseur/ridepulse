@@ -215,11 +215,16 @@ why the handlers have to tolerate duplicates (section 5).
 
 All handler panics, in any service, take the permanent path (3e).
 
-assignment-service runs two runners, one per topic, with two readers in the
-same consumer group (`assignment-service`). Each topic's partitions are
-assigned correctly, but a reader joining or leaving triggers a rebalance
-that affects both. If one runner fails fatally the other is cancelled and
-`Run` returns the first error.
+assignment-service runs two runners, one per topic, each with its own
+consumer group: `assignment-service` for `ride.matched` and
+`assignment-service-unmatched` for `ride.unmatched`. With a shared group the
+leader's metadata request for both topics fails as a whole while
+`ride.unmatched` does not exist yet (it is created lazily on the first
+business failure), which would leave the `ride.matched` reader without
+partitions too. With two groups a not-yet-existing `ride.unmatched` topic
+only delays the unmatched reader, and rebalances are independent. If one
+runner fails fatally the other is cancelled and `Run` returns the first
+error.
 
 **Matching** splits `Match` errors in `app.go`:
 
@@ -293,8 +298,8 @@ rate(match_idempotent_replays_total[1m])
 
 To inspect dead letters, consume the `*.dlq` topic and read the `x-error`
 and `x-original-*` headers. To check what is committed, describe the
-consumer groups `pricing-service`, `matching-service` and
-`assignment-service` with the Kafka CLI: lag should return to zero after a
+consumer groups `pricing-service`, `matching-service`,
+`assignment-service` and `assignment-service-unmatched` with the Kafka CLI: lag should return to zero after a
 clean shutdown and restart.
 
 ---

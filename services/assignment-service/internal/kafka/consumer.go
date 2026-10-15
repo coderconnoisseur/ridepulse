@@ -15,7 +15,12 @@ import (
 )
 
 const (
-	groupID = "assignment-service"
+	// Each topic gets its own consumer group. With one shared group, the
+	// group leader's metadata request for both topics fails as a whole while
+	// ride.unmatched does not exist yet (it is created lazily on the first
+	// business failure), leaving both readers without partitions.
+	matchedGroupID   = "assignment-service"
+	unmatchedGroupID = "assignment-service-unmatched"
 
 	matchedTopic      = "ride.matched"
 	matchedDLQTopic   = "ride.matched.dlq"
@@ -24,14 +29,14 @@ const (
 )
 
 // consumer is the topic-agnostic reader + DLQ writer pair shared by the
-// typed consumers below. Both topics use the same consumer group.
+// typed consumers below. Each topic has its own consumer group.
 type consumer struct {
 	reader   *kafka.Reader
 	dlq      *kafka.Writer
 	dlqTopic string
 }
 
-func newConsumer(brokers []string, topic, dlqTopic string) *consumer {
+func newConsumer(brokers []string, groupID, topic, dlqTopic string) *consumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers,
 		GroupID: groupID,
@@ -96,7 +101,7 @@ func (c *consumer) Close() error {
 type KafkaConsumer struct{ *consumer }
 
 func NewKafkaConsumer(brokers []string) *KafkaConsumer {
-	return &KafkaConsumer{newConsumer(brokers, matchedTopic, matchedDLQTopic)}
+	return &KafkaConsumer{newConsumer(brokers, matchedGroupID, matchedTopic, matchedDLQTopic)}
 }
 
 // Run consumes RideMatched events until ctx is cancelled.
@@ -111,7 +116,7 @@ func (c *KafkaConsumer) Run(
 type UnmatchedConsumer struct{ *consumer }
 
 func NewUnmatchedConsumer(brokers []string) *UnmatchedConsumer {
-	return &UnmatchedConsumer{newConsumer(brokers, unmatchedTopic, unmatchedDLQTopic)}
+	return &UnmatchedConsumer{newConsumer(brokers, unmatchedGroupID, unmatchedTopic, unmatchedDLQTopic)}
 }
 
 // Run consumes RideUnmatched events until ctx is cancelled.
