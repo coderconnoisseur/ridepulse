@@ -271,6 +271,30 @@ RIDER_RPS=300 RIDER_CONCURRENCY=120 go run cmd/rider-simulator/main.go
 `RIDER_URL` (defaults `http://localhost:8080/rides`) is the third
 env-var handle.
 
+#### Driver supply and DLQ topics (added with the correctness work)
+
+Drivers are no longer instantly reusable: a matched driver is removed from
+the GEO set and stays busy until the driver simulator releases it. Supply
+is controlled by environment variables on the driver simulator:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DRIVER_COUNT` | `1000` | Number of simulated drivers. |
+| `DRIVER_TRIP_DURATION` | `5s` | How long an assigned driver stays busy (Go duration). |
+| `REDIS_ADDR` | `localhost:6379` | Redis address. |
+
+Steady-state throughput is bounded by roughly `DRIVER_COUNT /
+DRIVER_TRIP_DURATION` matches per second, so set both deliberately and
+record them with the results. `tools/benchmark/benchmark-results.csv`
+predates this change and is not comparable; re-run the ladder.
+
+Each consumer dead-letters failures to `<topic>.dlq` (`ride.requested.dlq`,
+`ride.priced.dlq`, `ride.matched.dlq`), auto-created on first write. A
+healthy run leaves them empty; check `pricing_dlq_messages_total`,
+`matching_dlq_messages_total` and `assignment_dlq_messages_total` after each
+step. See [at-least-once-consumers.md](at-least-once-consumers.md) and
+[driver-state-model.md](driver-state-model.md).
+
 ### 3d. Verify the pipeline is closed
 
 ```bash
@@ -340,7 +364,22 @@ rate(driver_lock_released_phantom_total[1m])
   batches for these rides. Consider larger radius or fewer batches
   before failing.
 
-### 4e. Publish-error attribution
+### 4e. Retries, dead letters and replays
+
+```
+rate(pricing_retries_total[1m])
+rate(matching_retries_total[1m])
+increase(pricing_dlq_messages_total[5m])
+increase(matching_dlq_messages_total[5m])
+increase(assignment_dlq_messages_total[5m])
+rate(match_idempotent_replays_total[1m])
+```
+
+Any DLQ increase invalidates the step's success rate; inspect the `x-error`
+header on the DLQ record. `match_idempotent_replays_total` above zero means
+a retry or redelivery was absorbed without assigning a second driver.
+
+### 4f. Publish-error attribution
 
 ```
 rate(gateway_publish_errors_total[1m])
@@ -449,15 +488,11 @@ of scope for the "can we measure at all?" pass:
 - **Env-var config**. Every host is still hardcoded (`localhost:9092`,
   `localhost:6379`, etc.). Fine for a single-host benchmark; blocks
   running any service on a different box.
-- **Graceful shutdown**. Ctrl+C on pricing/matching/assignment leaves
-  Kafka mid-commit. During a benchmark this can leave duplicate work
-  on restart.
-- **Consumer "retry" that's actually a silent drop**. The comment
-  claims Kafka will retry on offset; the code moves on without
-  committing, which drops the message mid-session. Fix: proper DLQ or
-  explicit retry with backoff.
-- **Distinguish match-failed from publish-failed** in
-  `matching-service`. Today `_ = handler(event)` swallows both.
+- ~~Graceful shutdown~~, ~~silent-drop consumer retries~~ and
+  ~~match-failed vs publish-failed~~ are addressed by the shared consumer
+  runner; see [at-least-once-consumers.md](at-least-once-consumers.md).
+  Still open: `ride.unmatched` for rides with no driver, dedupe in
+  assignment-service, and rebalance-safe offset tracking.
 - **Grafana dashboards**. Prometheus's own UI is fine for reading
   metrics, but a permanent dashboard would make comparing benchmark
   runs faster.
