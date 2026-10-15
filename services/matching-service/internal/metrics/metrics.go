@@ -77,6 +77,13 @@ var (
 		},
 	)
 
+	MatchIdempotentReplays = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "match_idempotent_replays_total",
+			Help: "Match calls for rides that already had an assigned driver (retries/redeliveries); the existing driver was returned.",
+		},
+	)
+
 	MatchLatency = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "matching_latency_seconds",
@@ -90,6 +97,20 @@ var (
 			Name:    "nearby_driver_count",
 			Help:    "Number of nearby drivers",
 			Buckets: []float64{1, 5, 10, 20, 50, 100},
+		},
+	)
+
+	Retries = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "matching_retries_total",
+			Help: "Handler attempts that failed and were retried.",
+		},
+	)
+
+	DLQMessages = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "matching_dlq_messages_total",
+			Help: "Messages routed to the dead-letter topic.",
 		},
 	)
 
@@ -109,9 +130,12 @@ func Register() {
 		MatchRequests,
 		MatchSuccess,
 		MatchFailures,
+		MatchIdempotentReplays,
 		MatchLatency,
 		NearbyDrivers,
 		Goroutines,
+		Retries,
+		DLQMessages,
 		RedisGeoLatency,
 		NearbyDriversGauge,
 		DriverLockLatency,

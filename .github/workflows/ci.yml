@@ -18,6 +18,7 @@ jobs:
         # Each service is its own Go module (services/go.work ties them
         # together for local dev). CI checks every module independently.
         module:
+          - pkg
           - services/api-gateway
           - services/assignment-service
           - services/driver-simulator

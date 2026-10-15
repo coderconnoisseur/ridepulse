@@ -11,7 +11,7 @@ Event-driven ride matching in Go: Kafka between every stage, Redis GEO for nearb
 
 ## Results at a glance
 
-From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv); Windows dev box, single-partition Kafka, single Redis):
+From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv); Windows dev box, single-partition Kafka, single Redis). These numbers predate the at-least-once consumer and driver-state changes: drivers now stay busy for `DRIVER_TRIP_DURATION`, so the ladder must be re-run before results are comparable.
 
 - **50 RPS:** 99.7 % of rides matched, end-to-end p50 34 ms / p95 94 ms (gateway to assignment).
 - **Peak throughput:** the gateway took in ~400 RPS; the pipeline completed ~150 assignments/sec.
@@ -38,12 +38,12 @@ RidePulse follows an event-driven microservices design where each component has 
 |---|---|
 | **Rider Simulator** | Generates ride requests at configurable RPS against the HTTP gateway |
 | **API Gateway** | Accepts `POST /rides`, publishes `ride.requested` to Kafka |
-| **Pricing Service** | Consumes `ride.requested`, computes fare, publishes `ride.priced` |
-| **Matching Service** | Consumes `ride.priced`, runs geospatial search + atomic driver locking, publishes `ride.matched` |
-| **Assignment Service** | Consumes `ride.matched`, records the assignment, exposes end-to-end latency metrics |
-| **Driver Simulator** | Continuously updates live driver locations in Redis GEO |
+| **Pricing Service** | Consumes `ride.requested`, computes fare, publishes `ride.priced`; failures retried, then dead-lettered to `ride.requested.dlq` |
+| **Matching Service** | Consumes `ride.priced`, runs geospatial search + atomic driver locking, assigns the driver (idempotent per ride), publishes `ride.matched`; infrastructure failures retried, then dead-lettered to `ride.priced.dlq` |
+| **Assignment Service** | Consumes `ride.matched`, records the assignment, exposes end-to-end latency metrics; dead-letters to `ride.matched.dlq` |
+| **Driver Simulator** | Continuously updates live driver locations in Redis GEO; keeps assigned drivers out of the GEO set and releases them after `DRIVER_TRIP_DURATION` |
 | **Kafka** | Decouples every stage of the pipeline |
-| **Redis** | GEO indexing and distributed driver locking (with Lua safe-unlock) |
+| **Redis** | GEO indexing, distributed driver locking (Lua safe-unlock) and driver assignment state |
 | **Prometheus** | Latency, contention, and success-rate monitoring at every stage |
 
 ---
@@ -69,6 +69,8 @@ RiderSimulator ──HTTP POST /rides──▶ API Gateway
                                         ├── tier-preserving shuffle
                                         ├── SETNX + TTL → atomic driver lock
                                         │   (batch losers explicitly released)
+                                        ├── atomic assign: driver:assigned, ride:driver,
+                                        │   remove from GEO (replays return same driver)
                                         ▼
                                  Kafka: ride.matched
                                         │
@@ -111,11 +113,23 @@ Each match has its own 800 ms budget; each batch of 5 parallel `SETNX` attempts 
 
 Full write-up: [deadline-fix.md](docs/deadline-fix.md).
 
-### 5. Worker Pool with Bounded Concurrency
+### 5. At-least-once consumers with ordered commits and DLQs
 
-A CPU-aware worker pool sits between Kafka consumption and matching logic. This provides natural backpressure — if matching falls behind, the pool queue fills rather than spawning unbounded goroutines, preventing memory blowup under load spikes.
+Pricing, matching and assignment share one runner (`pkg/kafkaconsumer`). An offset is committed only after its message, and every earlier message of the partition, was handled or dead-lettered, so a crash redelivers instead of losing work. Failed handlers are retried with backoff, then written to `<topic>.dlq` with `x-error` / `x-original-*` headers; shutdown drains in-flight messages for up to 10 s.
 
-### 6. Observability-Driven Tuning
+Full write-up: [at-least-once-consumers.md](docs/at-least-once-consumers.md).
+
+### 6. Driver state model and idempotent matching
+
+A matched driver is now genuinely busy: matching atomically sets `driver:assigned:<id>`, writes `ride:driver:<rideID>` and removes the driver from the GEO set; the driver simulator ends the trip after `DRIVER_TRIP_DURATION` (default `5s`). Because `Match` first checks `ride:driver:<rideID>`, a retry or Kafka redelivery returns the same driver instead of assigning a second one.
+
+Full write-up: [driver-state-model.md](docs/driver-state-model.md).
+
+### 7. Worker Pool with Bounded Concurrency
+
+The shared consumer runner (`pkg/kafkaconsumer`) hands each fetched message to a fixed number of workers over an unbuffered channel. This provides natural backpressure — if handlers fall behind, fetching blocks rather than spawning unbounded goroutines or buffering messages, preventing memory blowup under load spikes.
+
+### 8. Observability-Driven Tuning
 
 Every stage exposes Prometheus metrics on its own port. `RequestedAt` is stamped at the api-gateway and propagated through every event so the terminal consumer can measure true end-to-end latency, not just per-stage latency.
 
@@ -125,12 +139,15 @@ Key exports:
 - `matching_latency_seconds`, `matching_success_total`, `matching_failures_total`
 - `driver_lock_conflict_total`, `driver_lock_released_phantom_total`
 - `end_to_end_latency_seconds`, `assignments_total`
+- `pricing_retries_total`, `matching_retries_total`, `pricing_dlq_messages_total`, `matching_dlq_messages_total`, `assignment_dlq_messages_total`, `match_idempotent_replays_total`
 
 ---
 
 ## Benchmarks
 
 The [`tools/benchmark`](tools/benchmark) runner walks a configurable RPS ladder against a running cluster, samples Prometheus at each step, and writes one CSV row per step.
+
+> **Note:** the committed results below predate the at-least-once and driver-state changes. Drivers now stay busy for `DRIVER_TRIP_DURATION` after a match, so supply is finite and the ladder must be re-run before new numbers are comparable with this CSV.
 
 The latest run is committed here:
 
@@ -155,9 +172,9 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 
 - **Matcher pool starvation.** The pool is `runtime.NumCPU() * 5` workers and each match may hold one for up to the 800 ms `matchDeadline`. Under contention, slow-fail matches occupy workers until the deadline and the queue backs up. Next: fail fast when the first batch is fully contended instead of waiting out the deadline, then re-measure pool size.
 - **Single-partition Kafka topics.** One partition per topic caps consumer parallelism per service. Next: partition by ride ID and run multiple consumers per stage.
-- **Hardcoded endpoints.** Services connect to `localhost:9092` and `localhost:6379` directly; only the rider simulator reads its config from environment variables. Next: env-based config so services can run inside Compose.
+- **Hardcoded endpoints.** Services connect to `localhost:9092` and `localhost:6379` directly; only the rider simulator and driver simulator (`REDIS_ADDR`) read their config from environment variables. Next: env-based config so services can run inside Compose.
 - **In-memory assignment store.** The assignment service keeps results in a map for benchmark verification; nothing is persisted.
-- **Test coverage is thin.** Unit tests cover the tier-preserving shuffle; locking and deadline behaviour are verified through metrics and benchmarks, not automated tests. Next: integration tests against a containerized Redis.
+- **Test coverage is unit-level.** Unit tests cover the tier-preserving shuffle, the at-least-once consumer runner (ordered commits, retries, DLQ, drain) and the Redis Lua scripts (locking, assignment, release) against an in-process Redis (miniredis). Nothing yet exercises real Kafka/Redis end to end. Next: integration tests against containerized Kafka and Redis.
 
 ---
 
@@ -168,6 +185,8 @@ Deep-dive engineering notes on the correctness and reliability changes:
 - 📄 [Phantom-lock race fix](docs/phantom-lock-fix.md)
 - 📄 [Deadline hierarchy fix](docs/deadline-fix.md)
 - 📄 [Shuffle vs nearest-first fix](docs/shuffle-nearest-first-fix.md)
+- 📄 [At-least-once consumers](docs/at-least-once-consumers.md)
+- 📄 [Driver state model](docs/driver-state-model.md)
 - 📄 [RPS benchmarking setup](docs/rps-benchmarking-setup.md)
 
 ---
@@ -234,6 +253,8 @@ go run cmd/benchmark/main.go
 ```
 
 Walks `50:20,100:40,200:80,300:120,500:200,800:300` (RPS:concurrency) by default and writes [`benchmark-results.csv`](tools/benchmark/benchmark-results.csv). Configurable via `--ladder`, `--warmup`, `--window`, `--cooldown`, `--output`.
+
+Driver supply is configurable on the driver simulator: `DRIVER_COUNT` (default `1000`), `DRIVER_TRIP_DURATION` (Go duration, default `5s`) and `REDIS_ADDR` (default `localhost:6379`).
 
 **Manual, one RPS level:**
 

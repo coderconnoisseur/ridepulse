@@ -33,3 +33,8 @@ func (p *KafkaPublisher) PublishRidePriced(
 	}
 	return p.writer.WriteMessages(ctx, msg)
 }
+
+// Close flushes and closes the underlying writer.
+func (p *KafkaPublisher) Close() error {
+	return p.writer.Close()
+}

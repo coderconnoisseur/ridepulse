@@ -25,6 +25,7 @@ const (
 	batchSize         = 5
 	batchDeadline     = BatchDeadline
 	releaseTimeout    = 200 * time.Millisecond
+	assignTimeout     = 200 * time.Millisecond
 	reaperGracePeriod = 500 * time.Millisecond
 
 	// driverTierSize groups nearby drivers into "distance tiers" that are
@@ -33,6 +34,10 @@ const (
 	// nearer one. See shuffleWithinTiers for the full rationale.
 	driverTierSize = 10
 )
+
+// ErrNoDriversAvailable means no free driver could be locked for the ride. It
+// is a business outcome, not an infrastructure failure, so it is not retried.
+var ErrNoDriversAvailable = errors.New("no drivers available")
 
 type Service struct {
 	repo ports.DriverRepository
@@ -82,6 +87,16 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		metrics.MatchLatency.Observe(time.Since(start).Seconds())
 	}()
 
+	// Idempotent replay: a retry or redelivery of a ride that already has a
+	// driver must return that driver, never lock and assign a second one.
+	if driverID, found, err := s.repo.GetRideDriver(ctx, event.RideID); err != nil {
+		metrics.MatchFailures.Inc()
+		return domain.RideMatchedEvent{}, err
+	} else if found {
+		metrics.MatchIdempotentReplays.Inc()
+		return matchedEvent(event, driverID), nil
+	}
+
 	drivers, err := s.repo.FindNearbyDrivers(ctx, event.Pickup.Lat, event.Pickup.Lng, 50)
 	if err != nil {
 		metrics.MatchFailures.Inc()
@@ -92,7 +107,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 
 	if len(drivers) == 0 {
 		metrics.MatchFailures.Inc()
-		return domain.RideMatchedEvent{}, errors.New("no drivers available")
+		return domain.RideMatchedEvent{}, ErrNoDriversAvailable
 	}
 
 	// Shuffle within distance tiers, NOT across the whole list.
@@ -129,19 +144,48 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		batch := drivers[i:end]
 
 		winnerID, ok := s.tryLockBatch(ctx, batch, event.RideID)
-		if ok {
-			metrics.MatchSuccess.Inc()
-			return domain.RideMatchedEvent{
-				RideID:      event.RideID,
-				DriverID:    winnerID,
-				MatchedAT:   time.Now().Unix(),
-				RequestedAt: event.RequestedAt,
-			}, nil
+		if !ok {
+			continue
 		}
+
+		// The returned driver may differ from winnerID if a concurrent
+		// attempt for the same ride assigned first; our lock is then freed.
+		assignedID, err := s.assign(ctx, winnerID, event.RideID)
+		if errors.Is(err, ports.ErrLockLost) {
+			// Lock expired between SETNX and assign; it is no longer ours
+			// to release. Try the next batch.
+			continue
+		}
+		if err != nil {
+			s.releaseLock(winnerID, event.RideID)
+			metrics.MatchFailures.Inc()
+			return domain.RideMatchedEvent{}, err
+		}
+		metrics.MatchSuccess.Inc()
+		return matchedEvent(event, assignedID), nil
 	}
 
 	metrics.MatchFailures.Inc()
-	return domain.RideMatchedEvent{}, errors.New("no drivers available")
+	return domain.RideMatchedEvent{}, ErrNoDriversAvailable
+}
+
+// assign runs AssignDriver on a context detached from the match deadline
+// (same rationale as releaseLock): once we hold a lock, the outer deadline
+// must not cut the assign reply mid-flight and leave a ride assigned in
+// Redis that the caller believes failed. Values (trace IDs etc.) are kept.
+func (s *Service) assign(ctx context.Context, driverID, rideID string) (string, error) {
+	assignCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), assignTimeout)
+	defer cancel()
+	return s.repo.AssignDriver(assignCtx, driverID, rideID)
+}
+
+func matchedEvent(event domain.RidePricedEvent, driverID string) domain.RideMatchedEvent {
+	return domain.RideMatchedEvent{
+		RideID:      event.RideID,
+		DriverID:    driverID,
+		MatchedAT:   time.Now().Unix(),
+		RequestedAt: event.RequestedAt,
+	}
 }
 
 // tryLockBatch races SETNX across the whole batch, picks the first successful

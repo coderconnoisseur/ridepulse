@@ -1,8 +1,14 @@
 package matching
 
 import (
+	"context"
+	"errors"
 	"strconv"
+	"sync"
 	"testing"
+
+	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/services/matching-service/internal/ports"
 )
 
 // TestShuffleWithinTiersPreservesTierBoundaries verifies the core invariant:
@@ -119,4 +125,229 @@ func equal(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// fakeRepo is an in-memory ports.DriverRepository for matcher tests.
+// Every lock attempt succeeds; AssignDriver is delegated to assignFn so each
+// test can script its outcome.
+type fakeRepo struct {
+	drivers []string
+
+	mu         sync.Mutex
+	rideDriver map[string]string
+	lockCalls  []string
+	assigns    []string
+	unlocks    []string
+	assignFn   func(call int, driverID, rideID string) (string, error)
+}
+
+func (f *fakeRepo) FindNearbyDrivers(ctx context.Context, lat, lng, radiusKM float64) ([]string, error) {
+	return append([]string(nil), f.drivers...), nil
+}
+
+func (f *fakeRepo) TryLockDriver(ctx context.Context, driverID, rideID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lockCalls = append(f.lockCalls, driverID)
+	return true, nil
+}
+
+func (f *fakeRepo) UnlockDriver(ctx context.Context, driverID, rideID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unlocks = append(f.unlocks, driverID)
+	return nil
+}
+
+func (f *fakeRepo) AssignDriver(ctx context.Context, driverID, rideID string) (string, error) {
+	f.mu.Lock()
+	call := len(f.assigns)
+	f.assigns = append(f.assigns, driverID)
+	fn := f.assignFn
+	f.mu.Unlock()
+	if fn == nil {
+		return driverID, nil
+	}
+	return fn(call, driverID, rideID)
+}
+
+func (f *fakeRepo) GetRideDriver(ctx context.Context, rideID string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d, ok := f.rideDriver[rideID]
+	return d, ok, nil
+}
+
+func (f *fakeRepo) snapshot() (locks, assigns, unlocks []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.lockCalls...),
+		append([]string(nil), f.assigns...),
+		append([]string(nil), f.unlocks...)
+}
+
+func driverIDs(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "driver-" + strconv.Itoa(i)
+	}
+	return out
+}
+
+func TestMatchReplaysExistingAssignment(t *testing.T) {
+	repo := &fakeRepo{
+		drivers:    driverIDs(10),
+		rideDriver: map[string]string{"ride-1": "driver-7"},
+	}
+	svc := New(repo)
+
+	got, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1", RequestedAt: 42})
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if got.RideID != "ride-1" || got.DriverID != "driver-7" || got.RequestedAt != 42 {
+		t.Fatalf("Match = %+v, want ride-1/driver-7/RequestedAt 42", got)
+	}
+	locks, assigns, _ := repo.snapshot()
+	if len(locks) != 0 || len(assigns) != 0 {
+		t.Fatalf("replay touched locks=%v assigns=%v, want none", locks, assigns)
+	}
+}
+
+func TestMatchLockLostOnFirstBatchMovesToNextBatch(t *testing.T) {
+	repo := &fakeRepo{
+		drivers: driverIDs(10),
+		assignFn: func(call int, driverID, rideID string) (string, error) {
+			if call == 0 {
+				return "", ports.ErrLockLost
+			}
+			return driverID, nil
+		},
+	}
+	svc := New(repo)
+
+	got, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	_, assigns, _ := repo.snapshot()
+	if len(assigns) != 2 {
+		t.Fatalf("assign calls = %v, want 2", assigns)
+	}
+	// Batches are disjoint slices of the driver list, so a different
+	// driver proves the second assign came from the next batch.
+	if assigns[0] == assigns[1] {
+		t.Fatalf("both assigns used %q; expected a driver from the next batch", assigns[0])
+	}
+	if got.DriverID != assigns[1] {
+		t.Fatalf("matched %q, want second assigned driver %q", got.DriverID, assigns[1])
+	}
+}
+
+func TestMatchUsesDriverReturnedByAssign(t *testing.T) {
+	repo := &fakeRepo{
+		drivers: driverIDs(5),
+		assignFn: func(call int, driverID, rideID string) (string, error) {
+			return "driver-earlier", nil
+		},
+	}
+	svc := New(repo)
+
+	got, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if got.DriverID != "driver-earlier" {
+		t.Fatalf("matched %q, want driver-earlier", got.DriverID)
+	}
+}
+
+func TestMatchAssignErrorReleasesLockAndFails(t *testing.T) {
+	boom := errors.New("redis down")
+	repo := &fakeRepo{
+		drivers: driverIDs(5),
+		assignFn: func(call int, driverID, rideID string) (string, error) {
+			return "", boom
+		},
+	}
+	svc := New(repo)
+
+	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
+	_, assigns, unlocks := repo.snapshot()
+	if len(assigns) != 1 {
+		t.Fatalf("assign calls = %v, want 1", assigns)
+	}
+	found := false
+	for _, u := range unlocks {
+		if u == assigns[0] {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("winner %q not unlocked; unlocks=%v", assigns[0], unlocks)
+	}
+}
+
+func TestMatchNoDriversReturnsErrNoDriversAvailable(t *testing.T) {
+	svc := New(&fakeRepo{})
+
+	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if !errors.Is(err, ErrNoDriversAvailable) {
+		t.Fatalf("err = %v, want ErrNoDriversAvailable", err)
+	}
+}
+
+func TestMatchAllAssignsLockLostReturnsErrNoDriversAvailable(t *testing.T) {
+	repo := &fakeRepo{
+		drivers: driverIDs(10),
+		assignFn: func(call int, driverID, rideID string) (string, error) {
+			return "", ports.ErrLockLost
+		},
+	}
+	svc := New(repo)
+
+	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if !errors.Is(err, ErrNoDriversAvailable) {
+		t.Fatalf("err = %v, want ErrNoDriversAvailable", err)
+	}
+}
+
+func TestMatchAssignIgnoresExpiredMatchDeadline(t *testing.T) {
+	var assignCtxErr error
+	repo := &fakeRepo{drivers: driverIDs(5)}
+	ctx, cancel := context.WithCancel(context.Background())
+	repo.assignFn = func(call int, driverID, rideID string) (string, error) {
+		// Match deadline fires while the assign is in flight.
+		cancel()
+		return driverID, nil
+	}
+	svc := New(repo)
+	svc.repo = assignCtxRecorder{fakeRepo: repo, errOut: &assignCtxErr}
+
+	got, err := svc.Match(ctx, domain.RidePricedEvent{RideID: "ride-1"})
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if got.DriverID == "" {
+		t.Fatal("no driver returned")
+	}
+	if assignCtxErr != nil {
+		t.Fatalf("assign context cancelled with match ctx: %v", assignCtxErr)
+	}
+}
+
+// assignCtxRecorder records whether the AssignDriver context was cancelled
+// after the fake's assignFn ran (which cancels the parent match context).
+type assignCtxRecorder struct {
+	*fakeRepo
+	errOut *error
+}
+
+func (a assignCtxRecorder) AssignDriver(ctx context.Context, driverID, rideID string) (string, error) {
+	id, err := a.fakeRepo.AssignDriver(ctx, driverID, rideID)
+	*a.errOut = ctx.Err()
+	return id, err
 }
