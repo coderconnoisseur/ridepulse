@@ -1,6 +1,7 @@
 go 1.25.6
 
 use (
+	../pkg
 	./api-gateway
 	./assignment-service
 	./driver-simulator
