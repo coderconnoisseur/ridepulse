@@ -15,7 +15,7 @@ import (
 func newTestRepo(t *testing.T) (*DriverRepository, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	repo := NewDriverRepository(mr.Addr())
+	repo := NewDriverRepository(mr.Addr(), 10)
 	t.Cleanup(func() { _ = repo.Close() })
 	return repo, mr
 }

@@ -5,7 +5,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
-func NewApp() *gin.Engine{
-	publisher:=NewKafkaPublisher([]string {"localhost:9092"})
-	return server.NewRouter(publisher)
-}	
+
+// NewApp wires the router and returns it with a close func that releases the
+// Kafka publisher; call it after the HTTP server has shut down.
+func NewApp(cfg Config) (*gin.Engine, func() error) {
+	publisher := NewKafkaPublisher(cfg.KafkaBrokers)
+	return server.NewRouter(publisher), publisher.Writer.Close
+}

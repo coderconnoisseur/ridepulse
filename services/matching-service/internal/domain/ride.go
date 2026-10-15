@@ -21,3 +21,12 @@ type RideMatchedEvent struct{
 	MatchedAT int64
 	RequestedAt int64 // carried through from RideRequestedEvent
 }
+
+// RideUnmatchedEvent is published when matching ends in a business failure
+// (no driver found, or the match deadline expired).
+type RideUnmatchedEvent struct{
+	RideID string
+	Reason string // "no_drivers" or "match_deadline"
+	RequestedAt int64 // UnixNano, carried through from RidePricedEvent
+	FailedAt int64 // UnixNano
+}

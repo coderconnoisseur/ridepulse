@@ -4,7 +4,9 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"ridepulse/services/rider-simulator/internal/simulator"
 )
@@ -14,7 +16,8 @@ import (
 // Falls back to the previous hardcoded defaults so a plain
 // `go run cmd/rider-simulator/main.go` still works.
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	url := envDefault("RIDER_URL", "http://localhost:8080/rides")
 	rps := envInt("RIDER_RPS", 500)
 	concurrency := envInt("RIDER_CONCURRENCY", 200)
@@ -22,7 +25,6 @@ func main() {
 	s := simulator.New(url)
 	log.Printf("Starting rider simulator: url=%s rps=%d concurrency=%d", url, rps, concurrency)
 	s.Run(ctx, rps, concurrency)
-	select {}
 }
 
 func envDefault(key, def string) string {
