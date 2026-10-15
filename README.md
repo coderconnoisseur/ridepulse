@@ -1,13 +1,22 @@
-![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)
-![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis-DC382D?style=for-the-badge&logo=redis&logoColor=white)
-![Apache Zookeeper](https://img.shields.io/badge/Apache%20Zookeeper-000000?style=for-the-badge&logo=apache&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
-![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white)
+# RidePulse
 
-#  RidePulse
+Event-driven ride matching in Go: Kafka between every stage, Redis GEO for nearby-driver search, atomic Redis locks for driver assignment, and Prometheus metrics end to end, load-tested with an automated RPS ladder.
 
-RidePulse is a high-throughput, event-driven ride-matching system designed to simulate real-world dispatch infrastructure under surge conditions.
+[![CI](https://github.com/coderconnoisseur/ridepulse/actions/workflows/ci.yml/badge.svg)](https://github.com/coderconnoisseur/ridepulse/actions/workflows/ci.yml)
+![Go 1.25](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
+![Kafka](https://img.shields.io/badge/Kafka-231F20?logo=apachekafka&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-DC382D?logo=redis&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?logo=prometheus&logoColor=white)
+![Docker Compose](https://img.shields.io/badge/Docker%20Compose-2496ED?logo=docker&logoColor=white)
+
+## Results at a glance
+
+From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv); Windows dev box, single-partition Kafka, single Redis):
+
+- **50 RPS:** 99.7 % of rides matched, end-to-end p50 34 ms / p95 94 ms (gateway to assignment).
+- **Peak throughput:** the gateway took in ~400 RPS; the pipeline completed ~150 assignments/sec.
+- **Matching stayed fast under load:** successful-match p95 was 33–84 ms at every step up to 800 RPS target.
+- **Where it breaks:** success drops to 66 % at 200 RPS and below 50 % from 300 RPS, and end-to-end p95 hits the 10 s histogram cap. The primary bottleneck identified is matcher worker-pool starvation (see [Known limitations](#known-limitations-and-next-steps)).
 
 **Core focus areas:**
 - Low-latency geospatial matching
@@ -17,10 +26,13 @@ RidePulse is a high-throughput, event-driven ride-matching system designed to si
 
 ---
 
-##  Architecture Overview
+## Architecture Overview
 
 RidePulse follows an event-driven microservices design where each component has a single, well-scoped responsibility:
+
 ![RidePulse Architecture](./assets/Architecture.png)
+
+*The diagram shows the core Kafka/Redis pipeline. The API gateway (in front of `ride.requested`) and the assignment service (consuming `ride.matched`) are shown in the table and in [Request Flow](#request-flow) below.*
 
 | Component | Role |
 |---|---|
@@ -36,7 +48,7 @@ RidePulse follows an event-driven microservices design where each component has 
 
 ---
 
-##  Request Flow
+## Request Flow
 
 ```
 RiderSimulator ──HTTP POST /rides──▶ API Gateway
@@ -69,7 +81,7 @@ RiderSimulator ──HTTP POST /rides──▶ API Gateway
 
 ---
 
-##  Core Engineering Decisions
+## Core Engineering Decisions
 
 ### 1. Geospatial Indexing with Redis GEO
 
@@ -116,7 +128,7 @@ Key exports:
 
 ---
 
-##  Benchmarks
+## Benchmarks
 
 The [`tools/benchmark`](tools/benchmark) runner walks a configurable RPS ladder against a running cluster, samples Prometheus at each step, and writes one CSV row per step.
 
@@ -136,6 +148,16 @@ Headline from that run (Windows dev box, single-partition Kafka, single Redis, ~
 The primary bottleneck is matcher pool starvation from slow-fail matches: under contention, ~30 % of matches consume workers for the full 800 ms `matchDeadline`, blowing past `NumCPU × 5` worker capacity. Fixing this (fail-fast on batch 1 saturation, multi-partition Kafka topics, larger pool) is the next set of unlocks.
 
 See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook, ladder shape, PromQL queries, and interpretation notes.
+
+---
+
+## Known limitations and next steps
+
+- **Matcher pool starvation.** The pool is `runtime.NumCPU() * 5` workers and each match may hold one for up to the 800 ms `matchDeadline`. Under contention, slow-fail matches occupy workers until the deadline and the queue backs up. Next: fail fast when the first batch is fully contended instead of waiting out the deadline, then re-measure pool size.
+- **Single-partition Kafka topics.** One partition per topic caps consumer parallelism per service. Next: partition by ride ID and run multiple consumers per stage.
+- **Hardcoded endpoints.** Services connect to `localhost:9092` and `localhost:6379` directly; only the rider simulator reads its config from environment variables. Next: env-based config so services can run inside Compose.
+- **In-memory assignment store.** The assignment service keeps results in a map for benchmark verification; nothing is persisted.
+- **Test coverage is thin.** Unit tests cover the tier-preserving shuffle; locking and deadline behaviour are verified through metrics and benchmarks, not automated tests. Next: integration tests against a containerized Redis.
 
 ---
 
@@ -160,12 +182,12 @@ Deep-dive engineering notes on the correctness and reliability changes:
 
 ---
 
-##  Running RidePulse
+## Running RidePulse
 
 ### Prerequisites
 
-- Docker and Docker Compose installed
-- Go 1.25+
+- Docker with Compose (`docker compose`, or the older `docker-compose`)
+- Go 1.25.6+ (the version in each `go.mod`)
 
 ### 1. Start Infrastructure
 
@@ -173,7 +195,7 @@ From `deployment/`, bring up Kafka, Zookeeper, Redis, and Prometheus:
 
 ```bash
 cd deployment
-docker-compose up -d
+docker compose up -d
 ```
 
 Verify:
@@ -181,7 +203,7 @@ Verify:
 - Redis: `localhost:6379`
 - Prometheus UI: http://localhost:9090
 
-### 2. Start the services (one terminal each)
+### 2. Start the services (one terminal each, from the repo root)
 
 ```bash
 cd services/matching-service   && go run cmd/matching-service/main.go
@@ -241,4 +263,13 @@ Verify pipeline closure by querying assignment-service directly:
 ```bash
 curl http://localhost:2114/count            # total assignments observed
 curl http://localhost:2114/assignments/<id> # look up a specific ride
+```
+
+### 5. Run the checks CI runs
+
+Each service is its own Go module (tied together by `services/go.work` for local development). CI runs `go vet`, `go build`, and `go test` in every module; the unit tests need no Kafka or Redis:
+
+```bash
+cd services/matching-service
+go vet ./... && go build ./... && go test ./...
 ```

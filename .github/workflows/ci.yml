@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each service is its own Go module (services/go.work ties them
+        # together for local dev). CI checks every module independently.
+        module:
+          - services/api-gateway
+          - services/assignment-service
+          - services/driver-simulator
+          - services/matching-service
+          - services/pricing-service
+          - services/rider-simulator
+          - tools/benchmark
+    env:
+      # Build each module against its own go.mod/go.sum, not the workspace.
+      GOWORK: "off"
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # Unit tests are pure Go; none need Kafka or Redis.
+      - name: go test
+        run: go test -count=1 ./...
