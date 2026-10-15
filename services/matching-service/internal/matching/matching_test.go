@@ -290,3 +290,64 @@ func TestMatchAssignErrorReleasesLockAndFails(t *testing.T) {
 		t.Fatalf("winner %q not unlocked; unlocks=%v", assigns[0], unlocks)
 	}
 }
+
+func TestMatchNoDriversReturnsErrNoDriversAvailable(t *testing.T) {
+	svc := New(&fakeRepo{})
+
+	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if !errors.Is(err, ErrNoDriversAvailable) {
+		t.Fatalf("err = %v, want ErrNoDriversAvailable", err)
+	}
+}
+
+func TestMatchAllAssignsLockLostReturnsErrNoDriversAvailable(t *testing.T) {
+	repo := &fakeRepo{
+		drivers: driverIDs(10),
+		assignFn: func(call int, driverID, rideID string) (string, error) {
+			return "", ports.ErrLockLost
+		},
+	}
+	svc := New(repo)
+
+	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	if !errors.Is(err, ErrNoDriversAvailable) {
+		t.Fatalf("err = %v, want ErrNoDriversAvailable", err)
+	}
+}
+
+func TestMatchAssignIgnoresExpiredMatchDeadline(t *testing.T) {
+	var assignCtxErr error
+	repo := &fakeRepo{drivers: driverIDs(5)}
+	ctx, cancel := context.WithCancel(context.Background())
+	repo.assignFn = func(call int, driverID, rideID string) (string, error) {
+		// Match deadline fires while the assign is in flight.
+		cancel()
+		return driverID, nil
+	}
+	svc := New(repo)
+	svc.repo = assignCtxRecorder{fakeRepo: repo, errOut: &assignCtxErr}
+
+	got, err := svc.Match(ctx, domain.RidePricedEvent{RideID: "ride-1"})
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if got.DriverID == "" {
+		t.Fatal("no driver returned")
+	}
+	if assignCtxErr != nil {
+		t.Fatalf("assign context cancelled with match ctx: %v", assignCtxErr)
+	}
+}
+
+// assignCtxRecorder records whether the AssignDriver context was cancelled
+// after the fake's assignFn ran (which cancels the parent match context).
+type assignCtxRecorder struct {
+	*fakeRepo
+	errOut *error
+}
+
+func (a assignCtxRecorder) AssignDriver(ctx context.Context, driverID, rideID string) (string, error) {
+	id, err := a.fakeRepo.AssignDriver(ctx, driverID, rideID)
+	*a.errOut = ctx.Err()
+	return id, err
+}

@@ -72,10 +72,16 @@ func Run(ctx context.Context) error {
 
 		match, err := matcher.Match(matchCtx, event)
 		if err != nil {
-			// No driver / deadline is a business outcome, not a retryable
-			// failure: log it and commit the offset.
-			log.Printf("matching failed for ride %s: %v", event.RideID, err)
-			return nil
+			if isBusinessFailure(err) {
+				// No driver / match deadline is a business outcome, not a
+				// retryable failure: log it and commit the offset.
+				log.Printf("matching failed for ride %s: %v", event.RideID, err)
+				return nil
+			}
+			// Redis/infra error: return it so the runner retries (and then
+			// dead-letters). Retries are safe: Match replays an existing
+			// assignment via ride:driver instead of matching again.
+			return err
 		}
 
 		// Publish gets its OWN budget derived from the handler ctx, not from
@@ -103,4 +109,10 @@ func Run(ctx context.Context) error {
 	}
 	log.Printf("matching-service stopped")
 	return runErr
+}
+
+// isBusinessFailure reports whether a Match error is a business outcome
+// (commit and move on) rather than an infrastructure failure (retry).
+func isBusinessFailure(err error) bool {
+	return errors.Is(err, matching.ErrNoDriversAvailable) || errors.Is(err, context.DeadlineExceeded)
 }

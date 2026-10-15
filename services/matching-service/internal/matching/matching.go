@@ -25,6 +25,7 @@ const (
 	batchSize         = 5
 	batchDeadline     = BatchDeadline
 	releaseTimeout    = 200 * time.Millisecond
+	assignTimeout     = 200 * time.Millisecond
 	reaperGracePeriod = 500 * time.Millisecond
 
 	// driverTierSize groups nearby drivers into "distance tiers" that are
@@ -33,6 +34,10 @@ const (
 	// nearer one. See shuffleWithinTiers for the full rationale.
 	driverTierSize = 10
 )
+
+// ErrNoDriversAvailable means no free driver could be locked for the ride. It
+// is a business outcome, not an infrastructure failure, so it is not retried.
+var ErrNoDriversAvailable = errors.New("no drivers available")
 
 type Service struct {
 	repo ports.DriverRepository
@@ -102,7 +107,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 
 	if len(drivers) == 0 {
 		metrics.MatchFailures.Inc()
-		return domain.RideMatchedEvent{}, errors.New("no drivers available")
+		return domain.RideMatchedEvent{}, ErrNoDriversAvailable
 	}
 
 	// Shuffle within distance tiers, NOT across the whole list.
@@ -145,7 +150,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 
 		// The returned driver may differ from winnerID if a concurrent
 		// attempt for the same ride assigned first; our lock is then freed.
-		assignedID, err := s.repo.AssignDriver(ctx, winnerID, event.RideID)
+		assignedID, err := s.assign(ctx, winnerID, event.RideID)
 		if errors.Is(err, ports.ErrLockLost) {
 			// Lock expired between SETNX and assign; it is no longer ours
 			// to release. Try the next batch.
@@ -161,7 +166,17 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 	}
 
 	metrics.MatchFailures.Inc()
-	return domain.RideMatchedEvent{}, errors.New("no drivers available")
+	return domain.RideMatchedEvent{}, ErrNoDriversAvailable
+}
+
+// assign runs AssignDriver on a context detached from the match deadline
+// (same rationale as releaseLock): once we hold a lock, the outer deadline
+// must not cut the assign reply mid-flight and leave a ride assigned in
+// Redis that the caller believes failed. Values (trace IDs etc.) are kept.
+func (s *Service) assign(ctx context.Context, driverID, rideID string) (string, error) {
+	assignCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), assignTimeout)
+	defer cancel()
+	return s.repo.AssignDriver(assignCtx, driverID, rideID)
 }
 
 func matchedEvent(event domain.RidePricedEvent, driverID string) domain.RideMatchedEvent {
