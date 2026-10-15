@@ -11,7 +11,7 @@ Event-driven ride matching in Go: Kafka between every stage, Redis GEO for nearb
 
 ## Results at a glance
 
-From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv); Windows dev box, single-partition Kafka, single Redis):
+From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv); Windows dev box, single-partition Kafka, single Redis). These numbers predate the at-least-once consumer and driver-state changes: drivers now stay busy for `DRIVER_TRIP_DURATION`, so the ladder must be re-run before results are comparable.
 
 - **50 RPS:** 99.7 % of rides matched, end-to-end p50 34 ms / p95 94 ms (gateway to assignment).
 - **Peak throughput:** the gateway took in ~400 RPS; the pipeline completed ~150 assignments/sec.
@@ -172,9 +172,9 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 
 - **Matcher pool starvation.** The pool is `runtime.NumCPU() * 5` workers and each match may hold one for up to the 800 ms `matchDeadline`. Under contention, slow-fail matches occupy workers until the deadline and the queue backs up. Next: fail fast when the first batch is fully contended instead of waiting out the deadline, then re-measure pool size.
 - **Single-partition Kafka topics.** One partition per topic caps consumer parallelism per service. Next: partition by ride ID and run multiple consumers per stage.
-- **Hardcoded endpoints.** Services connect to `localhost:9092` and `localhost:6379` directly; only the rider simulator reads its config from environment variables. Next: env-based config so services can run inside Compose.
+- **Hardcoded endpoints.** Services connect to `localhost:9092` and `localhost:6379` directly; only the rider simulator and driver simulator (`REDIS_ADDR`) read their config from environment variables. Next: env-based config so services can run inside Compose.
 - **In-memory assignment store.** The assignment service keeps results in a map for benchmark verification; nothing is persisted.
-- **Test coverage is thin.** Unit tests cover the tier-preserving shuffle; locking and deadline behaviour are verified through metrics and benchmarks, not automated tests. Next: integration tests against a containerized Redis.
+- **Test coverage is unit-level.** Unit tests cover the tier-preserving shuffle, the at-least-once consumer runner (ordered commits, retries, DLQ, drain) and the Redis Lua scripts (locking, assignment, release) against an in-process Redis (miniredis). Nothing yet exercises real Kafka/Redis end to end. Next: integration tests against containerized Kafka and Redis.
 
 ---
 
