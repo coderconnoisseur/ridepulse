@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"ridepulse/pkg/events"
+	"ridepulse/pkg/health"
 	"ridepulse/services/assignment-service/internal/domain"
 	"ridepulse/services/assignment-service/internal/httpapi"
 	"ridepulse/services/assignment-service/internal/kafka"
@@ -25,7 +27,9 @@ func Run(ctx context.Context, cfg Config) error {
 	metrics.Register()
 	mem := store.NewMemory()
 
-	server := httpapi.NewServer(cfg.HTTPAddr, mem)
+	server := httpapi.NewServer(cfg.HTTPAddr, mem, map[string]health.Check{
+		"kafka": health.Kafka(cfg.KafkaBrokers),
+	})
 	go func() {
 		log.Printf("assignment-service listening on %s", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -75,8 +79,8 @@ func Run(ctx context.Context, cfg Config) error {
 
 // handleMatched records a matched ride. Metrics are observed only for the
 // first delivery; redeliveries count as duplicates.
-func handleMatched(mem *store.Memory) func(context.Context, domain.RideMatchedEvent) error {
-	return func(_ context.Context, event domain.RideMatchedEvent) error {
+func handleMatched(mem *store.Memory) func(context.Context, events.RideMatchedEvent) error {
+	return func(_ context.Context, event events.RideMatchedEvent) error {
 		var latencyMs int64
 		if event.RequestedAt > 0 {
 			latencyMs = (time.Now().UnixNano() - event.RequestedAt) / int64(time.Millisecond)
@@ -84,7 +88,7 @@ func handleMatched(mem *store.Memory) func(context.Context, domain.RideMatchedEv
 		isNew := mem.PutMatched(domain.Assignment{
 			RideID:    event.RideID,
 			DriverID:  event.DriverID,
-			MatchedAT: event.MatchedAT,
+			MatchedAT: event.MatchedAt,
 			LatencyMs: latencyMs,
 		})
 		if !isNew {
@@ -103,8 +107,8 @@ func handleMatched(mem *store.Memory) func(context.Context, domain.RideMatchedEv
 
 // handleUnmatched records a failed ride, ignoring duplicates and rides that
 // already have an outcome.
-func handleUnmatched(mem *store.Memory) func(context.Context, domain.RideUnmatchedEvent) error {
-	return func(_ context.Context, event domain.RideUnmatchedEvent) error {
+func handleUnmatched(mem *store.Memory) func(context.Context, events.RideUnmatchedEvent) error {
+	return func(_ context.Context, event events.RideUnmatchedEvent) error {
 		if !mem.PutUnmatched(event.RideID, event.Reason, event.FailedAt) {
 			metrics.UnmatchedDuplicates.Inc()
 			return nil

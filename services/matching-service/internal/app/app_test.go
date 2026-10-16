@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/pkg/events"
 	"ridepulse/services/matching-service/internal/matching"
 )
 
@@ -51,12 +51,12 @@ func TestUnmatchedReason(t *testing.T) {
 }
 
 type fakeMatcher struct {
-	match       domain.RideMatchedEvent
+	match       events.RideMatchedEvent
 	err         error
 	waitForDone bool // block until the match ctx expires, like a real slow match
 }
 
-func (f fakeMatcher) Match(ctx context.Context, _ domain.RidePricedEvent) (domain.RideMatchedEvent, error) {
+func (f fakeMatcher) Match(ctx context.Context, _ events.RidePricedEvent) (events.RideMatchedEvent, error) {
 	if f.waitForDone {
 		<-ctx.Done()
 	}
@@ -64,17 +64,17 @@ func (f fakeMatcher) Match(ctx context.Context, _ domain.RidePricedEvent) (domai
 }
 
 type fakePublisher struct {
-	matched      []domain.RideMatchedEvent
-	unmatched    []domain.RideUnmatchedEvent
+	matched      []events.RideMatchedEvent
+	unmatched    []events.RideUnmatchedEvent
 	unmatchedErr error
 }
 
-func (f *fakePublisher) PublishRideMatched(_ context.Context, e domain.RideMatchedEvent) error {
+func (f *fakePublisher) PublishRideMatched(_ context.Context, e events.RideMatchedEvent) error {
 	f.matched = append(f.matched, e)
 	return nil
 }
 
-func (f *fakePublisher) PublishRideUnmatched(_ context.Context, e domain.RideUnmatchedEvent) error {
+func (f *fakePublisher) PublishRideUnmatched(_ context.Context, e events.RideUnmatchedEvent) error {
 	if f.unmatchedErr != nil {
 		return f.unmatchedErr
 	}
@@ -86,7 +86,7 @@ func TestHandlerPublishesUnmatchedOnBusinessFailure(t *testing.T) {
 	pub := &fakePublisher{}
 	h := newHandler(fakeMatcher{err: matching.ErrNoDriversAvailable}, pub, time.Second)
 	before := time.Now().UnixNano()
-	if err := h(context.Background(), domain.RidePricedEvent{RideID: "r1", RequestedAt: 42}); err != nil {
+	if err := h(context.Background(), events.RidePricedEvent{RideID: "r1", RequestedAt: 42}); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 	if len(pub.matched) != 0 || len(pub.unmatched) != 1 {
@@ -101,7 +101,7 @@ func TestHandlerPublishesUnmatchedOnBusinessFailure(t *testing.T) {
 func TestHandlerUnmatchedOnMatchDeadline(t *testing.T) {
 	pub := &fakePublisher{}
 	h := newHandler(fakeMatcher{err: context.DeadlineExceeded, waitForDone: true}, pub, time.Millisecond)
-	if err := h(context.Background(), domain.RidePricedEvent{RideID: "r2"}); err != nil {
+	if err := h(context.Background(), events.RidePricedEvent{RideID: "r2"}); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 	if len(pub.unmatched) != 1 || pub.unmatched[0].Reason != "match_deadline" {
@@ -113,7 +113,7 @@ func TestHandlerReturnsUnmatchedPublishError(t *testing.T) {
 	boom := errors.New("kafka down")
 	pub := &fakePublisher{unmatchedErr: boom}
 	h := newHandler(fakeMatcher{err: matching.ErrNoDriversAvailable}, pub, time.Second)
-	if err := h(context.Background(), domain.RidePricedEvent{RideID: "r3"}); !errors.Is(err, boom) {
+	if err := h(context.Background(), events.RidePricedEvent{RideID: "r3"}); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want publish error", err)
 	}
 }
@@ -121,7 +121,7 @@ func TestHandlerReturnsUnmatchedPublishError(t *testing.T) {
 func TestHandlerInfraErrorPublishesNothing(t *testing.T) {
 	pub := &fakePublisher{}
 	h := newHandler(fakeMatcher{err: errors.New("redis down")}, pub, time.Second)
-	if err := h(context.Background(), domain.RidePricedEvent{RideID: "r4"}); err == nil {
+	if err := h(context.Background(), events.RidePricedEvent{RideID: "r4"}); err == nil {
 		t.Fatal("want error")
 	}
 	if len(pub.unmatched) != 0 || len(pub.matched) != 0 {
@@ -131,8 +131,8 @@ func TestHandlerInfraErrorPublishesNothing(t *testing.T) {
 
 func TestHandlerPublishesMatchedOnSuccess(t *testing.T) {
 	pub := &fakePublisher{}
-	h := newHandler(fakeMatcher{match: domain.RideMatchedEvent{RideID: "r5", DriverID: "d"}}, pub, time.Second)
-	if err := h(context.Background(), domain.RidePricedEvent{RideID: "r5"}); err != nil {
+	h := newHandler(fakeMatcher{match: events.RideMatchedEvent{RideID: "r5", DriverID: "d"}}, pub, time.Second)
+	if err := h(context.Background(), events.RidePricedEvent{RideID: "r5"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(pub.matched) != 1 || len(pub.unmatched) != 0 {

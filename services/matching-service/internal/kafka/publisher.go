@@ -1,44 +1,47 @@
 package kafka
-import(
+
+import (
 	"context"
 	"encoding/json"
 	"errors"
 	"github.com/segmentio/kafka-go"
-	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/pkg/events"
 )
-type KafkaPublisher struct{
-	writer *kafka.Writer;
+
+type KafkaPublisher struct {
+	writer          *kafka.Writer
 	unmatchedWriter *kafka.Writer
 }
-func NewKafkaPublisher (brokers[] string)*KafkaPublisher{
-	writer:=&kafka.Writer{
-		Addr: kafka.TCP(brokers...),
-		Topic:"ride.matched",
-		Balancer: &kafka.Hash{},
+
+func NewKafkaPublisher(brokers []string) *KafkaPublisher {
+	writer := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Topic:        events.TopicRideMatched,
+		Balancer:     &kafka.Hash{},
 		RequiredAcks: kafka.RequireOne,
-		BatchTimeout: 10_000_000,//10ms
+		BatchTimeout: 10_000_000, //10ms
 	}
-	unmatched:=&kafka.Writer{
-		Addr: kafka.TCP(brokers...),
-		Topic:"ride.unmatched",
-		Balancer: &kafka.Hash{},
-		RequiredAcks: kafka.RequireOne,
-		BatchTimeout: 10_000_000,//10ms
-		AllowAutoTopicCreation: true,// new topic
+	unmatched := &kafka.Writer{
+		Addr:                   kafka.TCP(brokers...),
+		Topic:                  events.TopicRideUnmatched,
+		Balancer:               &kafka.Hash{},
+		RequiredAcks:           kafka.RequireOne,
+		BatchTimeout:           10_000_000, //10ms
+		AllowAutoTopicCreation: true,       // new topic
 	}
 	return &KafkaPublisher{writer, unmatched}
 }
 
 func (p *KafkaPublisher) PublishRideMatched(
 	ctx context.Context,
-	event domain.RideMatchedEvent,
-)error{
-	val,err:=json.Marshal(event)
-	if err!=nil{
+	event events.RideMatchedEvent,
+) error {
+	val, err := json.Marshal(event)
+	if err != nil {
 		return err
 	}
-	msg:=kafka.Message{
-		Key: []byte(event.RideID),//kafka only understands byte arrays , (language agnostic)
+	msg := kafka.Message{
+		Key:   []byte(event.RideID), //kafka only understands byte arrays , (language agnostic)
 		Value: val,
 	}
 	return p.writer.WriteMessages(ctx, msg)
@@ -47,14 +50,14 @@ func (p *KafkaPublisher) PublishRideMatched(
 // PublishRideUnmatched writes a ride.unmatched event keyed by ride ID.
 func (p *KafkaPublisher) PublishRideUnmatched(
 	ctx context.Context,
-	event domain.RideUnmatchedEvent,
-)error{
-	val,err:=json.Marshal(event)
-	if err!=nil{
+	event events.RideUnmatchedEvent,
+) error {
+	val, err := json.Marshal(event)
+	if err != nil {
 		return err
 	}
 	return p.unmatchedWriter.WriteMessages(ctx, kafka.Message{
-		Key: []byte(event.RideID),
+		Key:   []byte(event.RideID),
 		Value: val,
 	})
 }

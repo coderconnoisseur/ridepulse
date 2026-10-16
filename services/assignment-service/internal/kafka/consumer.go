@@ -9,8 +9,8 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
+	"ridepulse/pkg/events"
 	"ridepulse/pkg/kafkaconsumer"
-	"ridepulse/services/assignment-service/internal/domain"
 	"ridepulse/services/assignment-service/internal/metrics"
 )
 
@@ -22,9 +22,9 @@ const (
 	matchedGroupID   = "assignment-service"
 	unmatchedGroupID = "assignment-service-unmatched"
 
-	matchedTopic      = "ride.matched"
+	matchedTopic      = events.TopicRideMatched
 	matchedDLQTopic   = "ride.matched.dlq"
-	unmatchedTopic    = "ride.unmatched"
+	unmatchedTopic    = events.TopicRideUnmatched
 	unmatchedDLQTopic = "ride.unmatched.dlq"
 )
 
@@ -107,7 +107,7 @@ func NewKafkaConsumer(brokers []string) *KafkaConsumer {
 // Run consumes RideMatched events until ctx is cancelled.
 func (c *KafkaConsumer) Run(
 	ctx context.Context,
-	handler func(ctx context.Context, event domain.RideMatchedEvent) error,
+	handler func(ctx context.Context, event events.RideMatchedEvent) error,
 ) error {
 	return run(ctx, c.consumer, "RideMatched", handler)
 }
@@ -122,7 +122,7 @@ func NewUnmatchedConsumer(brokers []string) *UnmatchedConsumer {
 // Run consumes RideUnmatched events until ctx is cancelled.
 func (c *UnmatchedConsumer) Run(
 	ctx context.Context,
-	handler func(ctx context.Context, event domain.RideUnmatchedEvent) error,
+	handler func(ctx context.Context, event events.RideUnmatchedEvent) error,
 ) error {
 	return run(ctx, c.consumer, "RideUnmatched", handler)
 }

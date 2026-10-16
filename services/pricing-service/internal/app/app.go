@@ -10,7 +10,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"ridepulse/services/pricing-service/internal/domain"
+	"ridepulse/pkg/events"
+	"ridepulse/pkg/health"
 	"ridepulse/services/pricing-service/internal/kafka"
 	"ridepulse/services/pricing-service/internal/metrics"
 	"ridepulse/services/pricing-service/internal/pricing"
@@ -19,6 +20,7 @@ import (
 const (
 	publishTimeout  = 300 * time.Millisecond
 	shutdownTimeout = 5 * time.Second
+	readyTimeout    = 1 * time.Second
 )
 
 // Run serves metrics and consumes RideRequested events until ctx is
@@ -30,6 +32,10 @@ func Run(ctx context.Context, cfg Config) error {
 	// it can't collide with anything registered on http.DefaultServeMux.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/health", health.Liveness())
+	mux.Handle("/ready", health.Readiness(readyTimeout, map[string]health.Check{
+		"kafka": health.Kafka(cfg.KafkaBrokers),
+	}))
 	server := &http.Server{
 		Addr:         cfg.MetricsAddr,
 		Handler:      mux,
@@ -50,7 +56,7 @@ func Run(ctx context.Context, cfg Config) error {
 	)
 	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
-	runErr := consumer.Run(ctx, func(ctx context.Context, event domain.RideRequestedEvent) error {
+	runErr := consumer.Run(ctx, func(ctx context.Context, event events.RideRequestedEvent) error {
 		// Counts handler attempts (retries included); pricing_retries_total
 		// counts the retries among them.
 		metrics.EventsConsumed.Inc()

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/pkg/events"
 	"ridepulse/services/matching-service/internal/metrics"
 	"ridepulse/services/matching-service/internal/ports"
 )
@@ -87,7 +87,7 @@ func shuffleWithinTiers(drivers []string, tierSize int) {
 	}
 }
 
-func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (domain.RideMatchedEvent, error) {
+func (s *Service) Match(ctx context.Context, event events.RidePricedEvent) (events.RideMatchedEvent, error) {
 
 	start := time.Now()
 	metrics.MatchRequests.Inc()
@@ -100,7 +100,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 	// driver must return that driver, never lock and assign a second one.
 	if driverID, found, err := s.repo.GetRideDriver(ctx, event.RideID); err != nil {
 		metrics.MatchFailures.Inc()
-		return domain.RideMatchedEvent{}, err
+		return events.RideMatchedEvent{}, err
 	} else if found {
 		metrics.MatchIdempotentReplays.Inc()
 		return matchedEvent(event, driverID), nil
@@ -109,14 +109,14 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 	drivers, err := s.repo.FindNearbyDrivers(ctx, event.Pickup.Lat, event.Pickup.Lng, 50)
 	if err != nil {
 		metrics.MatchFailures.Inc()
-		return domain.RideMatchedEvent{}, err
+		return events.RideMatchedEvent{}, err
 	}
 
 	metrics.NearbyDrivers.Observe(float64(len(drivers)))
 
 	if len(drivers) == 0 {
 		metrics.MatchFailures.Inc()
-		return domain.RideMatchedEvent{}, ErrNoDriversAvailable
+		return events.RideMatchedEvent{}, ErrNoDriversAvailable
 	}
 
 	// Shuffle within distance tiers, NOT across the whole list.
@@ -141,7 +141,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		select {
 		case <-ctx.Done():
 			metrics.MatchFailures.Inc()
-			return domain.RideMatchedEvent{}, ctx.Err()
+			return events.RideMatchedEvent{}, ctx.Err()
 		default:
 		}
 
@@ -168,14 +168,14 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		if err != nil {
 			s.releaseLock(winnerID, event.RideID)
 			metrics.MatchFailures.Inc()
-			return domain.RideMatchedEvent{}, fmt.Errorf("%w: %w", ErrAssign, err)
+			return events.RideMatchedEvent{}, fmt.Errorf("%w: %w", ErrAssign, err)
 		}
 		metrics.MatchSuccess.Inc()
 		return matchedEvent(event, assignedID), nil
 	}
 
 	metrics.MatchFailures.Inc()
-	return domain.RideMatchedEvent{}, ErrNoDriversAvailable
+	return events.RideMatchedEvent{}, ErrNoDriversAvailable
 }
 
 // assign runs AssignDriver on a context detached from the match deadline
@@ -188,11 +188,12 @@ func (s *Service) assign(ctx context.Context, driverID, rideID string) (string, 
 	return s.repo.AssignDriver(assignCtx, driverID, rideID)
 }
 
-func matchedEvent(event domain.RidePricedEvent, driverID string) domain.RideMatchedEvent {
-	return domain.RideMatchedEvent{
+func matchedEvent(event events.RidePricedEvent, driverID string) events.RideMatchedEvent {
+	return events.RideMatchedEvent{
+		Version:     events.Version,
 		RideID:      event.RideID,
 		DriverID:    driverID,
-		MatchedAT:   time.Now().Unix(),
+		MatchedAt:   time.Now().Unix(),
 		RequestedAt: event.RequestedAt,
 	}
 }

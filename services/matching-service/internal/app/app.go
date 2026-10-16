@@ -9,7 +9,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/pkg/events"
+	"ridepulse/pkg/health"
 	"ridepulse/services/matching-service/internal/kafka"
 	"ridepulse/services/matching-service/internal/matching"
 	"ridepulse/services/matching-service/internal/metrics"
@@ -35,6 +36,8 @@ const (
 	publishDeadline      = 300 * time.Millisecond
 
 	shutdownTimeout = 5 * time.Second
+	// readyTimeout bounds the whole /ready probe (Kafka dial + Redis PING).
+	readyTimeout = 1 * time.Second
 )
 
 // Run serves metrics and consumes RidePriced events until ctx is cancelled,
@@ -42,10 +45,19 @@ const (
 func Run(ctx context.Context, cfg Config) error {
 	metrics.Register()
 
-	// Dedicated mux so the scrape endpoint can't collide with anything
-	// registered on http.DefaultServeMux.
+	// --- Dependencies ---
+	driverRepo := redis.NewDriverRepository(cfg.RedisAddr, cfg.RedisPoolSize)
+	matcher := matching.New(driverRepo)
+
+	// Dedicated mux so the scrape and probe endpoints can't collide with
+	// anything registered on http.DefaultServeMux.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/health", health.Liveness())
+	mux.Handle("/ready", health.Readiness(readyTimeout, map[string]health.Check{
+		"kafka": health.Kafka(cfg.KafkaBrokers),
+		"redis": driverRepo.Ping,
+	}))
 	server := &http.Server{
 		Addr:         cfg.MetricsAddr,
 		Handler:      mux,
@@ -58,10 +70,6 @@ func Run(ctx context.Context, cfg Config) error {
 			log.Printf("matching-service metrics server: %v", err)
 		}
 	}()
-
-	// --- Dependencies ---
-	driverRepo := redis.NewDriverRepository(cfg.RedisAddr, cfg.RedisPoolSize)
-	matcher := matching.New(driverRepo)
 
 	consumer := kafka.NewKafkaConsumer(cfg.KafkaBrokers, cfg.MatchWorkers)
 	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
@@ -104,18 +112,18 @@ func isBusinessFailure(err, matchCtxErr error) bool {
 // matcherAPI and eventPublisher are the handler's collaborators, narrowed so
 // the handler can be tested with fakes.
 type matcherAPI interface {
-	Match(ctx context.Context, event domain.RidePricedEvent) (domain.RideMatchedEvent, error)
+	Match(ctx context.Context, event events.RidePricedEvent) (events.RideMatchedEvent, error)
 }
 
 type eventPublisher interface {
-	PublishRideMatched(ctx context.Context, event domain.RideMatchedEvent) error
-	PublishRideUnmatched(ctx context.Context, event domain.RideUnmatchedEvent) error
+	PublishRideMatched(ctx context.Context, event events.RideMatchedEvent) error
+	PublishRideUnmatched(ctx context.Context, event events.RideUnmatchedEvent) error
 }
 
 // newHandler builds the per-ride handler: match, then publish ride.matched,
 // or on a business failure publish ride.unmatched so the rider is told.
-func newHandler(matcher matcherAPI, publisher eventPublisher, matchDeadline time.Duration) func(context.Context, domain.RidePricedEvent) error {
-	return func(ctx context.Context, event domain.RidePricedEvent) error {
+func newHandler(matcher matcherAPI, publisher eventPublisher, matchDeadline time.Duration) func(context.Context, events.RidePricedEvent) error {
+	return func(ctx context.Context, event events.RidePricedEvent) error {
 		matchCtx, matchCancel := context.WithTimeout(ctx, matchDeadline)
 		defer matchCancel()
 
@@ -129,7 +137,8 @@ func newHandler(matcher matcherAPI, publisher eventPublisher, matchDeadline time
 				publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
 				defer publishCancel()
 				// A publish failure is returned so the runner retries it.
-				if perr := publisher.PublishRideUnmatched(publishCtx, domain.RideUnmatchedEvent{
+				if perr := publisher.PublishRideUnmatched(publishCtx, events.RideUnmatchedEvent{
+					Version:     events.Version,
 					RideID:      event.RideID,
 					Reason:      reason,
 					RequestedAt: event.RequestedAt,
@@ -161,7 +170,7 @@ func newHandler(matcher matcherAPI, publisher eventPublisher, matchDeadline time
 // outer match deadline.
 func unmatchedReason(err error) string {
 	if errors.Is(err, matching.ErrNoDriversAvailable) {
-		return "no_drivers"
+		return events.ReasonNoDrivers
 	}
-	return "match_deadline"
+	return events.ReasonMatchDeadline
 }
