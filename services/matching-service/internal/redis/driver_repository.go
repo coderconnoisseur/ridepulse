@@ -154,6 +154,11 @@ func (r *DriverRepository) UnlockDriver(
 	return err
 }
 
+// Ping checks that Redis answers; used by the /ready probe.
+func (r *DriverRepository) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
+}
+
 // Close closes the underlying Redis client.
 func (r *DriverRepository) Close() error {
 	return r.client.Close()

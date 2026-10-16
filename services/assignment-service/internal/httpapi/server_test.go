@@ -13,7 +13,7 @@ import (
 
 func get(mem *store.Memory, path string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	NewServer("", mem).Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	NewServer("", mem, nil).Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 	return rec
 }
 

@@ -2,9 +2,10 @@ package ports
 
 import (
 	"context"
-	"ridepulse/services/api-gateway/internal/domain"
+
+	"ridepulse/pkg/events"
 )
 
 type EventPublisher interface {
-	PublishRideRequested(ctx context.Context, event domain.RideRequestedEvent) error
+	PublishRideRequested(ctx context.Context, event events.RideRequestedEvent) error
 }
