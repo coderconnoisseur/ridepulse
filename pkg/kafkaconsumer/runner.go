@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"runtime/debug"
 	"strconv"
@@ -39,6 +40,8 @@ const (
 	maxRetryBackoff     = time.Second
 	defaultDrainTimeout = 10 * time.Second
 	commitTimeout       = 5 * time.Second
+	minFetchBackoff     = 100 * time.Millisecond
+	maxFetchBackoff     = 5 * time.Second
 )
 
 // Config configures Run.
@@ -83,8 +86,9 @@ type runner struct {
 }
 
 // Run blocks until ctx is cancelled (returns nil after a clean drain) or
-// a fatal error occurs (fetch error not caused by ctx, commit error, or a
-// DLQ write that failed after retries) — then it drains and returns it.
+// a fatal error occurs (closed reader, commit error, or a DLQ write that
+// failed after retries) — then it drains and returns it. Other fetch errors
+// are logged and retried with backoff.
 // Run never closes the Reader or DLQ Writer; the caller owns them.
 func Run(ctx context.Context, r Reader, cfg Config, h Handler) error {
 	if err := cfg.validate(r, h); err != nil {
@@ -171,14 +175,33 @@ func (c *Config) applyDefaults() {
 }
 
 func (rn *runner) fetchLoop(ctx context.Context, work chan<- job) {
+	backoff := minFetchBackoff
 	for {
 		msg, err := rn.r.FetchMessage(ctx)
 		if err != nil {
-			if ctx.Err() == nil {
-				rn.fatal(fmt.Errorf("kafkaconsumer: fetch: %w", err))
+			if ctx.Err() != nil {
+				return
 			}
-			return
+			// kafka-go returns io.EOF only once the reader is closed.
+			if errors.Is(err, io.EOF) {
+				rn.fatal(fmt.Errorf("kafkaconsumer: fetch: %w", err))
+				return
+			}
+			// Anything else may pass: leader elections and coordinator moves
+			// surface here too. The reader reconnects by itself, and /ready
+			// is what reports a broker that stays down.
+			log.Printf("kafkaconsumer: fetch: %v (retrying in %s)", err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			if backoff *= 2; backoff > maxFetchBackoff {
+				backoff = maxFetchBackoff
+			}
+			continue
 		}
+		backoff = minFetchBackoff
 		epoch := rn.tracker.track(msg)
 		select {
 		case work <- job{msg, epoch}:

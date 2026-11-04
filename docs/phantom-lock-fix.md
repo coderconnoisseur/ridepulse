@@ -1,8 +1,6 @@
 # Phantom Lock Fix — Matching Service
 
-> **Status:** local-only note. Not intended for the public repo.
-> Documents a correctness bug in `services/matching-service` that caused driver
-> availability to silently degrade under contention, plus the fix applied.
+> **Superseded.** The live benchmark showed this locking design was itself the bottleneck, and it has been replaced by an atomic driver claim. See [matching-under-load.md](matching-under-load.md). This note is kept as a record of the earlier work; its code no longer exists.
 
 ---
 

@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RidePulse Live</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --line: #dfe2e8; --text: #1b2230; --muted: #5d6675;
+  --free: #0b7f8c; --busy: #c96a00; --bad: #c62f3b; --good: #1a7f4b; --accent: #3c5bd6;
+  --map: #fbfbfc; --grid: #eceef2; --shadow: 0 1px 2px rgba(20, 30, 50, .06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11141a; --panel: #1a1f28; --line: #2c3340; --text: #e8ebf0; --muted: #9aa3b2;
+    --free: #3fc3d0; --busy: #f2a33c; --bad: #f0626d; --good: #49c285; --accent: #8aa0f5;
+    --map: #151920; --grid: #222832; --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1380px; margin: 0 auto; padding: 14px 16px 22px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 12px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+.sub { color: var(--muted); flex: 1 1 280px; }
+.pill { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 99px; border: 1px solid var(--line); background: var(--panel); white-space: nowrap; }
+.pill.live { color: var(--good); }
+.pill.off { color: var(--bad); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.label { font-size: 12px; color: var(--muted); }
+h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
+
+.pipeline { display: grid; grid-template-columns: 1fr 22px 1fr 22px 1fr 22px 1fr; align-items: stretch; margin-bottom: 12px; }
+.stage { padding: 9px 12px; min-width: 0; }
+.stage.down { border-color: var(--bad); }
+.stage-head { display: flex; align-items: center; gap: 7px; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); flex: none; }
+.down .dot { background: var(--bad); }
+.stage-rate { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stage-rate small { font-size: 12px; font-weight: 400; color: var(--muted); }
+.queue { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 18px; }
+.bar { flex: 1; height: 5px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--busy); transition: width .4s; }
+.arrow { display: flex; align-items: center; justify-content: center; color: var(--muted); }
+
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; }
+.mapcard { padding: 10px; display: flex; flex-direction: column; min-width: 0; }
+#map { width: 100%; flex: 1; min-height: 430px; display: block; border-radius: 6px; background: var(--map); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; }
+.tile b { display: block; font-size: 21px; line-height: 1.2; font-variant-numeric: tabular-nums; font-weight: 650; }
+.section { padding: 10px 12px; }
+#chart { width: 100%; height: 76px; display: block; }
+.chartkey { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.controls label { display: flex; justify-content: space-between; font-size: 13px; }
+input[type=range] { width: 100%; margin: 4px 0 8px; accent-color: var(--accent); }
+.buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+button { font: inherit; font-size: 13px; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; text-align: left; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button:disabled { opacity: .55; cursor: default; }
+button.danger { color: var(--bad); }
+.hint { font-size: 12px; color: var(--muted); margin: 7px 0 0; min-height: 34px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--muted); padding: 0 0 3px; }
+td { padding: 2px 0; border-top: 1px solid var(--line); white-space: nowrap; }
+td:last-child, th:last-child { text-align: right; }
+#log { margin: 0; padding: 0; list-style: none; font-size: 12px; color: var(--muted); min-height: 54px; }
+#log li { padding: 2px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+#log li:first-child { border-top: 0; color: var(--text); }
+.counts { display: flex; flex-wrap: wrap; gap: 3px 14px; font-size: 12px; color: var(--muted); margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.counts b { color: var(--text); font-weight: 600; }
+footer { margin-top: 12px; font-size: 12px; color: var(--muted); }
+footer a { color: var(--accent); }
+#replaybar { display: none; margin-bottom: 12px; padding: 8px 12px; font-size: 13px; }
+
+@media (max-width: 960px) {
+  .main { grid-template-columns: minmax(0, 1fr); }
+  #map { min-height: 320px; }
+}
+@media (max-width: 640px) {
+  .pipeline { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .arrow { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>RidePulse</h1>
+    <span class="sub">An event-driven ride-matching backend, working in real time. Riders and drivers are simulated; everything else is the real system.</span>
+    <span class="pill" id="status" role="status">Connecting…</span>
+  </header>
+
+  <div class="card" id="replaybar"></div>
+
+  <div class="pipeline" aria-label="Ride pipeline">
+    <div class="card stage" id="s-gateway"><div class="stage-head"><i class="dot"></i>API gateway</div><div class="stage-rate"><span id="r-gateway">0</span> <small>accepted/sec</small></div><div class="queue">Takes the ride request</div></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="card stage" id="s-pricing"><div class="stage-head"><i class="dot"></i>Pricing</div><div class="stage-rate"><span id="r-pricing">0</span> <small>priced/sec</small></div><div class="queue">Queue <span id="q-pricing">0</span><span class="bar"><i id="b-pricing"></i></span></div></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="card stage" id="s-matching"><div class="stage-head"><i class="dot"></i>Matching</div><div class="stage-rate"><span id="r-matching">0</span> <small>decided/sec</small></div><div class="queue">Queue <span id="q-matching">0</span><span class="bar"><i id="b-matching"></i></span></div></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="card stage" id="s-assignment"><div class="stage-head"><i class="dot"></i>Assignment</div><div class="stage-rate"><span id="r-assignment">0</span> <small>recorded/sec</small></div><div class="queue">Queue <span id="q-assignment">0</span><span class="bar"><i id="b-assignment"></i></span></div></div>
+  </div>
+
+  <div class="main">
+    <div class="card mapcard">
+      <canvas id="map" role="img" aria-label="Map of simulated drivers and ride requests in Bengaluru"></canvas>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--free)"></i><span id="l-free">0</span> free drivers</span>
+        <span><i class="swatch" style="background:var(--busy)"></i><span id="l-busy">0</span> on a trip</span>
+        <span>Line: a driver just matched to a pickup</span>
+        <span style="color:var(--bad)">✕ no driver free</span>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="card tiles">
+        <div class="tile"><span class="label">Matched/sec</span><b id="t-matched">0</b></div>
+        <div class="tile"><span class="label">No driver/sec</span><b id="t-unmatched">0</b></div>
+        <div class="tile"><span class="label">Request to match, p95</span><b id="t-p95">–</b></div>
+        <div class="tile"><span class="label">Surge multiplier</span><b id="t-surge">1.0×</b></div>
+      </div>
+
+      <div class="card section">
+        <div class="chartkey"><span style="color:var(--free)">— matched/sec</span><span style="color:var(--bad)">— no driver/sec</span><span>last 2 minutes</span></div>
+        <canvas id="chart"></canvas>
+      </div>
+
+      <div class="card section controls" id="controls">
+        <h2>Try it</h2>
+        <label for="demand"><span>Ride requests per second</span><b id="demand-value">30</b></label>
+        <input id="demand" type="range" min="0" max="400" step="5" value="30">
+        <div class="buttons">
+          <button id="b-rush" data-hint="Sends far more rides than drivers can serve for 25 seconds. Watch surge rise and drivers run out.">Rush hour</button>
+          <button id="b-bad" data-hint="Sends a corrupt message. It moves to a dead-letter topic and everything else keeps running.">Send a bad message</button>
+          <button id="b-dup" data-hint="Delivers the last ride again, as Kafka can after a crash. It keeps the same driver.">Deliver a ride twice</button>
+          <button id="b-crash" class="danger" data-hint="Force-kills the matching service. Rides wait in its queue, and none are lost when it comes back, usually within 30 seconds.">Crash matching</button>
+        </div>
+        <p class="hint" id="hint">Hover or focus a button to see what it does.</p>
+      </div>
+
+      <div class="card section">
+        <h2>Latest matched rides</h2>
+        <table>
+          <thead><tr><th>Ride</th><th>Driver</th><th>Surge</th><th>Fare</th></tr></thead>
+          <tbody id="rides"></tbody>
+        </table>
+      </div>
+
+      <div class="card section">
+        <h2>Since the demo started</h2>
+        <div class="counts">
+          <span>Requests <b id="c-requested">0</b></span>
+          <span>Matched <b id="c-matched">0</b></span>
+          <span>No driver <b id="c-unmatched">0</b></span>
+          <span>Dead-lettered <b id="c-dead">0</b></span>
+          <span>Replays <b id="c-replays">0</b></span>
+          <span>Duplicates ignored <b id="c-dups">0</b></span>
+        </div>
+        <ul id="log" aria-live="polite"></ul>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    Fares are straight-line distance × ₹12 + ₹50, times surge. Single Kafka partition per topic, one copy of each service, all on this machine.
+    <a href="https://github.com/coderconnoisseur/ridepulse">Source and known limitations</a>
+  </footer>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const BOUNDS = { minLat: 12.87, maxLat: 12.95, minLng: 77.57, maxLng: 77.65 };
+  const CHART_POINTS = 120, FADE_MS = 1600, QUEUE_SCALE = 2000;
+  const fmt = n => Math.round(n).toLocaleString('en-IN');
+  const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  let colors = {};
+  const readColors = () => {
+    colors = { free: css('--free'), busy: css('--busy'), bad: css('--bad'), map: css('--map'), grid: css('--grid'), muted: css('--muted'), text: css('--text') };
+  };
+  readColors();
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readColors);
+
+  // ---------- map ----------
+  const map = $('map'), mapCtx = map.getContext('2d');
+  let current = new Map(), previous = new Map(), busy = [], frameTime = 0;
+  let flashes = [], crosses = [];
+
+  const fit = (canvas, ctx) => {
+    const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(r.width * dpr) || canvas.height !== Math.round(r.height * dpr)) {
+      canvas.width = Math.round(r.width * dpr);
+      canvas.height = Math.round(r.height * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return r;
+  };
+  const project = (lat, lng, w, h) => {
+    const size = Math.min(w, h);
+    return [
+      w / 2 + ((lng - BOUNDS.minLng) / (BOUNDS.maxLng - BOUNDS.minLng) - .5) * size,
+      h / 2 - ((lat - BOUNDS.minLat) / (BOUNDS.maxLat - BOUNDS.minLat) - .5) * size,
+    ];
+  };
+
+  const drawMap = now => {
+    const { width: w, height: h } = fit(map, mapCtx);
+    const c = mapCtx;
+    c.fillStyle = colors.map; c.fillRect(0, 0, w, h);
+    c.strokeStyle = colors.grid; c.lineWidth = 1;
+    const step = Math.max(w, h) / 16;
+    for (let x = (w % step) / 2; x < w; x += step) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke(); }
+    for (let y = (h % step) / 2; y < h; y += step) { c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke(); }
+
+    const t = Math.min(1, (now - frameTime) / 1000);
+    c.fillStyle = colors.free;
+    c.beginPath();
+    current.forEach((p, id) => {
+      const q = previous.get(id) || p;
+      const [x, y] = project(q[0] + (p[0] - q[0]) * t, q[1] + (p[1] - q[1]) * t, w, h);
+      c.moveTo(x + 2.6, y); c.arc(x, y, 2.6, 0, 6.3);
+    });
+    c.fill();
+
+    c.fillStyle = colors.busy;
+    c.beginPath();
+    busy.forEach(p => { const [x, y] = project(p[1], p[2], w, h); c.moveTo(x + 3.2, y); c.arc(x, y, 3.2, 0, 6.3); });
+    c.fill();
+
+    flashes = flashes.filter(f => now - f.at < FADE_MS);
+    flashes.forEach(f => {
+      const a = 1 - (now - f.at) / FADE_MS;
+      const [x2, y2] = project(f.pickup[0], f.pickup[1], w, h);
+      c.globalAlpha = a; c.strokeStyle = colors.busy; c.lineWidth = 1.5;
+      if (f.from) {
+        const [x1, y1] = project(f.from[0], f.from[1], w, h);
+        c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke();
+      }
+      c.beginPath(); c.arc(x2, y2, 4, 0, 6.3); c.stroke();
+    });
+
+    crosses = crosses.filter(f => now - f.at < FADE_MS);
+    c.strokeStyle = colors.bad; c.lineWidth = 1.6;
+    crosses.forEach(f => {
+      c.globalAlpha = 1 - (now - f.at) / FADE_MS;
+      const [x, y] = project(f.pickup[0], f.pickup[1], w, h);
+      c.beginPath(); c.moveTo(x - 4, y - 4); c.lineTo(x + 4, y + 4); c.moveTo(x + 4, y - 4); c.lineTo(x - 4, y + 4); c.stroke();
+    });
+    c.globalAlpha = 1;
+    requestAnimationFrame(drawMap);
+  };
+
+  // ---------- chart ----------
+  const chart = $('chart'), chartCtx = chart.getContext('2d');
+  const history = [];
+  const drawChart = () => {
+    const { width: w, height: h } = fit(chart, chartCtx);
+    const c = chartCtx;
+    c.clearRect(0, 0, w, h);
+    const peak = Math.max(10, ...history.map(p => Math.max(p.matched, p.unmatched)));
+    c.strokeStyle = colors.grid; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(0, h - .5); c.lineTo(w, h - .5); c.stroke();
+    c.fillStyle = colors.muted; c.font = '11px system-ui'; c.fillText(fmt(peak) + '/sec', 2, 10);
+    const line = (key, color) => {
+      c.strokeStyle = color; c.lineWidth = 1.8; c.beginPath();
+      history.forEach((p, i) => {
+        const x = w * (i + CHART_POINTS - history.length) / (CHART_POINTS - 1);
+        const y = h - 2 - (h - 14) * p[key] / peak;
+        i ? c.lineTo(x, y) : c.moveTo(x, y);
+      });
+      c.stroke();
+    };
+    line('unmatched', colors.bad);
+    line('matched', colors.free);
+  };
+
+  // ---------- frames ----------
+  const setStage = (name, rate, queue, up) => {
+    $('s-' + name).classList.toggle('down', !up);
+    $('r-' + name).textContent = up ? fmt(rate) : 'down';
+    if (queue !== undefined) {
+      $('q-' + name).textContent = fmt(queue);
+      $('b-' + name).style.width = Math.min(100, 100 * queue / QUEUE_SCALE) + '%';
+    }
+  };
+  const short = id => id.slice(0, 8);
+
+  const render = f => {
+    const q = f.queues || {}, s = f.services || {};
+    setStage('gateway', f.rates.requested, undefined, s.gateway);
+    setStage('pricing', f.rates.priced, q.pricing, s.pricing);
+    setStage('matching', f.rates.decided, q.matching, s.matching);
+    setStage('assignment', f.rates.matched + f.rates.unmatched, q.assignment, s.assignment);
+
+    previous = current;
+    current = new Map(f.free.map(p => [p[0], [p[1], p[2]]]));
+    busy = f.busy;
+    frameTime = performance.now();
+    $('l-free').textContent = fmt(f.free.length);
+    $('l-busy').textContent = fmt(f.busy.length);
+
+    const now = performance.now();
+    const positions = new Map(f.busy.map(p => [p[0], [p[1], p[2]]]));
+    (f.matches || []).forEach(m => flashes.push({ at: now, pickup: m.pickup, from: positions.get(+m.driver_id.replace('driver-', '')) }));
+    (f.unmatched || []).forEach(p => crosses.push({ at: now, pickup: p }));
+
+    $('t-matched').textContent = fmt(f.rates.matched);
+    $('t-unmatched').textContent = fmt(f.rates.unmatched);
+    $('t-p95').textContent = f.p95_ms ? fmt(f.p95_ms) + ' ms' : '–';
+    $('t-surge').textContent = f.surge.toFixed(1) + '×';
+    $('t-surge').style.color = f.surge > 1 ? colors.busy : '';
+
+    history.push({ matched: f.rates.matched, unmatched: f.rates.unmatched });
+    if (history.length > CHART_POINTS) history.shift();
+    drawChart();
+
+    $('rides').replaceChildren(...(f.recent || []).map(r => {
+      const tr = document.createElement('tr');
+      [short(r.ride_id), r.driver_id, r.surge.toFixed(1) + '×', '₹' + r.price.toFixed(2)].forEach(text => {
+        const td = document.createElement('td'); td.textContent = text; tr.append(td);
+      });
+      return tr;
+    }));
+    $('log').replaceChildren(...(f.notices || []).map(text => {
+      const li = document.createElement('li'); li.textContent = text; return li;
+    }));
+
+    const t = f.totals;
+    $('c-requested').textContent = fmt(t.requested);
+    $('c-matched').textContent = fmt(t.matched);
+    $('c-unmatched').textContent = fmt(t.unmatched);
+    $('c-dead').textContent = fmt(t.dead_letter);
+    $('c-replays').textContent = fmt(t.replays);
+    $('c-dups').textContent = fmt(t.duplicates);
+  };
+
+  // ---------- live or replay ----------
+  const status = (text, cls) => { const el = $('status'); el.textContent = text; el.className = 'pill ' + cls; };
+
+  const startReplay = async url => {
+    $('controls').style.display = 'none';
+    const bar = $('replaybar');
+    bar.style.display = 'block';
+    bar.textContent = 'This is a recording of a real run, played back in your browser, covering normal demand, a rush hour, a bad message, a duplicate and a crash. To run the system live, see the README.';
+    status('Recording', 'live');
+    const frames = await (await fetch(url)).json();
+    let i = 0;
+    const next = () => {
+      render(frames[i]);
+      i = (i + 1) % frames.length;
+      if (i === 0) history.length = 0;
+    };
+    next();
+    setInterval(next, 1000);
+  };
+
+  const control = (path, button) => async () => {
+    button.disabled = true;
+    try {
+      const resp = await fetch(path, { method: 'POST', headers: { 'X-RidePulse-Demo': '1' } });
+      if (!resp.ok) $('hint').textContent = (await resp.text()).trim();
+    } catch (err) {
+      $('hint').textContent = 'The dashboard could not be reached.';
+    }
+    setTimeout(() => { button.disabled = false; }, 1500);
+  };
+
+  const startLive = async () => {
+    const config = await (await fetch('api/config')).json();
+    const slider = $('demand');
+    slider.max = config.max_demand;
+    slider.value = config.demand;
+    $('demand-value').textContent = config.demand;
+    let pending;
+    slider.addEventListener('input', () => {
+      $('demand-value').textContent = slider.value;
+      clearTimeout(pending);
+      pending = setTimeout(() => fetch('api/demand?rps=' + slider.value, { method: 'POST', headers: { 'X-RidePulse-Demo': '1' } }), 150);
+    });
+    [['b-rush', 'api/rush'], ['b-bad', 'api/bad-message'], ['b-dup', 'api/redeliver'], ['b-crash', 'api/crash']].forEach(([id, path]) => {
+      const button = $(id);
+      button.addEventListener('click', control(path, button));
+      const show = () => { $('hint').textContent = button.dataset.hint; };
+      button.addEventListener('mouseenter', show);
+      button.addEventListener('focus', show);
+    });
+    if (!config.can_crash) $('b-crash').style.display = 'none';
+
+    const stream = new EventSource('api/stream');
+    stream.onopen = () => status('Live', 'live');
+    stream.onerror = () => status('Reconnecting…', 'off');
+    stream.onmessage = e => render(JSON.parse(e.data));
+  };
+
+  requestAnimationFrame(drawMap);
+  const replay = new URLSearchParams(location.search).get('replay');
+  // With no live backend, as on a static host, play the recording instead.
+  (replay ? startReplay(replay) : startLive().catch(() => startReplay('replay.json'))).catch(err => {
+    status('Unavailable', 'off');
+    console.error(err);
+  });
+})();
+</script>
+</body>
+</html>

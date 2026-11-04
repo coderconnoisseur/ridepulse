@@ -7,7 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"ridepulse/services/assignment-service/internal/domain"
+	"ridepulse/pkg/events"
 	"ridepulse/services/assignment-service/internal/metrics"
 	"ridepulse/services/assignment-service/internal/store"
 )
@@ -22,7 +22,7 @@ func counterDelta(c prometheus.Collector, fn func()) float64 {
 
 func TestHandleMatchedCountsEachRideOnce(t *testing.T) {
 	h := handleMatched(store.NewMemory())
-	event := domain.RideMatchedEvent{RideID: "ride-metric-m", DriverID: "d1", RequestedAt: 1}
+	event := events.RideMatchedEvent{RideID: "ride-metric-m", DriverID: "d1", RequestedAt: 1}
 
 	var dups float64
 	total := counterDelta(metrics.AssignmentsTotal, func() {
@@ -44,7 +44,7 @@ func TestHandleMatchedCountsEachRideOnce(t *testing.T) {
 
 func TestHandleUnmatchedCountsEachRideOnce(t *testing.T) {
 	h := handleUnmatched(store.NewMemory())
-	event := domain.RideUnmatchedEvent{RideID: "ride-metric-u", Reason: "no_drivers", RequestedAt: 1, FailedAt: 2}
+	event := events.RideUnmatchedEvent{RideID: "ride-metric-u", Reason: "no_drivers", RequestedAt: 1, FailedAt: 2}
 
 	var dups float64
 	total := counterDelta(metrics.UnmatchedTotal.WithLabelValues("no_drivers"), func() {

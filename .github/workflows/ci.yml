@@ -21,6 +21,7 @@ jobs:
           - pkg
           - services/api-gateway
           - services/assignment-service
+          - services/dashboard
           - services/driver-simulator
           - services/matching-service
           - services/pricing-service

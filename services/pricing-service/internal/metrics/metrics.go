@@ -28,6 +28,11 @@ var (
 		Help: "Messages routed to the dead-letter topic.",
 	})
 
+	SurgeMultiplier = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "pricing_surge_multiplier",
+		Help: "Surge multiplier currently applied to new fares (1.0 means no surge).",
+	})
+
 	ProcessingDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "pricing_processing_duration_seconds",
 		Help:    "Time to price and publish one RideRequested handler attempt (observed per attempt, retries included).",
@@ -42,6 +47,7 @@ func Register() {
 		PublishErrors,
 		Retries,
 		DLQMessages,
+		SurgeMultiplier,
 		ProcessingDuration,
 	)
 }

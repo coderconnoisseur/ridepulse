@@ -9,12 +9,12 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
+	"ridepulse/pkg/events"
 	"ridepulse/pkg/kafkaconsumer"
-	"ridepulse/services/matching-service/internal/domain"
 	"ridepulse/services/matching-service/internal/metrics"
 )
 
-const dlqTopic = "ride.priced.dlq"
+const dlqTopic = events.TopicRidePriced + ".dlq"
 
 type KafkaConsumer struct {
 	reader  *kafka.Reader
@@ -26,7 +26,7 @@ func NewKafkaConsumer(brokers []string, workers int) *KafkaConsumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers,
 		GroupID: "matching-service",
-		Topic:   "ride.priced",
+		Topic:   events.TopicRidePriced,
 		// Commits are issued by the runner after processing; the interval
 		// makes them asynchronous batches instead of one round trip each.
 		CommitInterval: time.Second,
@@ -55,7 +55,7 @@ func NewKafkaConsumer(brokers []string, workers int) *KafkaConsumer {
 // has been handled or dead-lettered.
 func (c *KafkaConsumer) Run(
 	ctx context.Context,
-	handler func(ctx context.Context, event domain.RidePricedEvent) error,
+	handler func(ctx context.Context, event events.RidePricedEvent) error,
 ) error {
 	cfg := kafkaconsumer.Config{
 		Workers:  c.workers,
@@ -65,7 +65,7 @@ func (c *KafkaConsumer) Run(
 		OnDLQ:    func(kafka.Message, error) { metrics.DLQMessages.Inc() },
 	}
 	return kafkaconsumer.Run(ctx, c.reader, cfg, func(ctx context.Context, msg kafka.Message) error {
-		var event domain.RidePricedEvent
+		var event events.RidePricedEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			return kafkaconsumer.Permanent(fmt.Errorf("decode RidePriced: %w", err))
 		}

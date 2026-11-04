@@ -1,10 +1,5 @@
 # Driver State Model — matching-service and driver-simulator
 
-> **Status:** local-only note. Not intended for the public repo.
-> Documents the driver-assignment bug in the matching path, the Redis state
-> model that replaced it, and how matching became idempotent under Kafka
-> redelivery.
-
 ---
 
 ## 1. The bug in one paragraph
@@ -40,103 +35,80 @@ Redis keys. matching-service and driver-simulator share them; do not rename.
 | Key | Type | Value | TTL | Written by |
 |---|---|---|---|---|
 | `drivers:locations` | GEO set | driver positions | none | simulator (`GEOADD`), matching (`ZREM` on assign) |
-| `driver:lock:<driverID>` | string | rideID | 3 s | matching (`SET NX PX`) |
 | `driver:assigned:<driverID>` | string | rideID | 10 min (safety net) | matching on assign; simulator deletes at trip end |
-| `ride:driver:<rideID>` | string | driverID | 1 h | matching on assign |
+| `ride:outcome:<rideID>` | hash | `driver` and `claimed_at`, or `unmatched_at` | 1 h matched, 10 min unmatched | matching, in the claim script |
 
 ### Lifecycle
 
 ```
-free ──TryLockDriver──▶ locked ──AssignDriver──▶ assigned ──ReleaseDriver──▶ free
- │                        │                         │
- │ in GEO, no keys        │ in GEO, lock key        │ NOT in GEO, assigned key,
- │                        │ (value = rideID)        │ ride:driver record
- │                        └─ lock TTL / unlock ────▶ free
- └────────────────────────────────────────────────── (assigned TTL 10 min ──▶ free)
+free ──claim script──▶ assigned ──ReleaseDriver──▶ free
+ │                        │
+ │ in GEO, no keys        │ NOT in GEO, assigned key, ride:outcome record
+ └────────────────────────┴── (assigned TTL 10 min ──▶ free)
 ```
 
-1. **free.** The driver is in `drivers:locations` and has no lock or
-   assigned key. The simulator's location updates write the GEO position.
-2. **locked.** `TryLockDriver` runs one Lua script: if
-   `driver:assigned:<id>` exists it refuses (returns 0), otherwise
-   `SET driver:lock:<id> <rideID> NX PX 3000`. The assigned check matters
-   because a `GEORADIUS` result can be stale by the time the lock is
-   attempted. Phantom locks (batch losers) are released with the
-   compare-and-delete unlock script, as in
-   [phantom-lock-fix.md](phantom-lock-fix.md).
-3. **assigned.** `AssignDriver` runs one atomic Lua script, in this order:
-   1. If `driver:lock:<id>` is not our rideID, return nil →
-      `ports.ErrLockLost`. The matcher moves on to the next batch; the lock
-      is no longer ours, so it is not released.
-   2. If `ride:driver:<rideID>` already exists, drop our lock and return the
-      existing driver untouched (replay, section 4).
-   3. Otherwise `SET driver:assigned:<id> <rideID> EX 600`,
-      `SET ride:driver:<rideID> <id> EX 3600`, `ZREM drivers:locations <id>`,
-      `DEL driver:lock:<id>`.
+1. **free.** The driver is in `drivers:locations` and has no assigned key.
+   The simulator's location updates write the GEO position.
+2. **assigned.** The claim script runs as one atomic step:
+   1. If `ride:outcome:<rideID>` exists, return that same outcome and change
+      nothing (replay, section 4).
+   2. Otherwise take the nearest drivers within the radius from
+      `drivers:locations`, and for the first without a
+      `driver:assigned:<id>` key: `SET driver:assigned:<id> <rideID> EX 600`,
+      `HSET ride:outcome:<rideID> driver <id> claimed_at <now>` (1 h),
+      `ZREM drivers:locations <id>`.
+   3. If none is free, `HSET ride:outcome:<rideID> unmatched_at <now>` (10 min)
+      and return nil. The ride is unmatched, and that is final.
 
-   Because it is one script, there is no window in which a driver is both
-   matchable and assigned, and no window in which the assignment exists
-   without its idempotency record.
-4. **released.** The driver simulator ends the trip (section 5) by deleting
+   Because it is one script, two rides can't claim one driver, there is no
+   window in which a driver is both matchable and assigned, and no window in
+   which the assignment exists without its idempotency record. The earlier
+   lock-based design and why it was replaced are covered in
+   [matching-under-load.md](matching-under-load.md).
+3. **released.** The driver simulator ends the trip (section 5) by deleting
    `driver:assigned:<id>` only if it still holds the same rideID. The next
    location update `GEOADD`s the driver back into the set.
 
 If the assigned key is never released (simulator down), it expires after 10
 minutes and the driver reappears with its next location update. The
-`ride:driver` record outlives the assignment on purpose (1 h): it is what
+`ride:outcome` record outlives the assignment on purpose (1 h): it is what
 makes a late redelivery recognizable after the driver is already free again.
 
 ---
 
-## 4. Idempotent replay via `ride:driver:<rideID>`
+## 4. Idempotent replay via `ride:outcome:<rideID>`
 
-`Match` begins with `GetRideDriver(rideID)`. If the record exists it
-returns a `RideMatchedEvent` for that driver immediately (counting
-`match_idempotent_replays_total`) and does no locking. This covers:
+The claim script begins by reading `ride:outcome:<rideID>`. If the record exists
+it returns that outcome and changes nothing: the same driver with the original
+claim time (counting `match_idempotent_replays_total`), or no driver. This covers:
 
 - a Kafka redelivery after a crash (the offset had not been flushed);
 - a runner retry after `PublishRideMatched` failed, so the ride is assigned
   in Redis but `ride.matched` was never emitted;
-- a retry after an infrastructure error that happened *after* the assign
-  script ran but before its reply arrived. The script already created the
-  record, so the retry finds it.
+- a retry after a timeout that happened *after* the claim script ran but
+  before its reply arrived. The script already created the record, so the
+  retry finds it.
 
-The assign script also covers the race in which two attempts for the same
-ride both hold a lock: the second to run sees the record, frees its own
-lock and returns the first attempt's driver.
-
-Limit: the record lives for one hour. A redelivery older than that would
-match again. Consumer lag is nowhere near that today.
+Limit: the record lives for one hour if matched and ten minutes if unmatched.
+The shorter TTL keeps Redis memory bounded, because unmatched rides can arrive
+much faster under overload. A redelivery older than that would be decided again.
+Consumer lag was nowhere near that in testing.
 
 ### Timeouts and context
 
-`AssignDriver` runs on a context detached from the match deadline
-(`context.WithoutCancel`, then a 200 ms timeout). Without that, a match
-that spent most of its match budget (`MATCH_DEADLINE`, default 500 ms) could have the assign cut off and the
-caller would believe the ride failed while Redis might have assigned it.
-
-Be honest about what the 200 ms bounds: the go-redis client is built with
-default options, so `ContextTimeoutEnabled` is false. A context deadline
-bounds waiting for a pooled connection, not the socket read or write; socket
-I/O falls back to the client's own default timeouts (3 s read). The detached
-200 ms is therefore a best-effort bound, not a hard one, and a stalled
-Redis can hold a match handler for up to that longer socket timeout. If
-that matters, enable `ContextTimeoutEnabled` on the client. The handler's
-error classification is what makes that safe: only the outer match deadline
-(`matchCtx.Err() != nil`) is treated as a business failure; any other
-`DeadlineExceeded`, and any assign error (`matching.ErrAssign`, even if the
-outer deadline has expired), is retried, and the retry replays through `ride:driver`.
+A claim runs on a context detached from caller cancellation
+(`context.WithoutCancel`) with a timeout of `MATCH_DEADLINE` (default 500 ms),
+and the Redis client has `ContextTimeoutEnabled` set so that the timeout also
+covers socket reads and writes. If a claim times out, its outcome is unknown:
+the script may have run with the reply lost. So the error is retried rather
+than reported as unmatched, and the retry replays through `ride:outcome`.
 
 ### Error handling around it
 
-- `ErrLockLost` → try the next batch.
-- Any other assign error → release our lock (fresh context), count a
-  failure and return the error. matching-service's handler returns it, so
-  the runner retries; the retry replays via the record if the assign had in
-  fact landed.
-- `ErrNoDriversAvailable` / `context.DeadlineExceeded` (outer match
-  deadline) → business failure: matching publishes `ride.unmatched` and
+- No driver → `ErrNoDriversAvailable`: matching publishes `ride.unmatched` and
   commits the offset (section 4b).
+- Any other error, including a timeout → returned to the runner, which retries
+  and then dead-letters. A retry replays the outcome if the script had run.
 
 ### 4b. The unmatched path
 
@@ -146,11 +118,11 @@ When matching ends without a driver, the handler publishes a
 | Field | Meaning |
 |---|---|
 | `RideID` | The ride (also the Kafka key). |
-| `Reason` | `no_drivers` (`ErrNoDriversAvailable`) or `match_deadline` (the outer match deadline expired). |
+| `Reason` | `no_drivers` (`ErrNoDriversAvailable`). |
 | `RequestedAt` | UnixNano stamp from the gateway, carried through for latency. |
 | `FailedAt` | UnixNano time the failure was decided. |
 
-Publishing has its own 300 ms budget, separate from the match deadline. If
+Publishing has its own 2 s budget. If
 the publish fails the handler returns the error, the runner retries it and
 eventually dead-letters the `ride.priced` message, as for any other
 infrastructure failure; the offset is committed only after the event is out.
@@ -159,18 +131,14 @@ writer is created with `AllowAutoTopicCreation`, so the first unmatched ride
 creates the topic; assignment-service dead-letters undecodable events to
 `ride.unmatched.dlq`.
 
-An unmatched ride writes no Redis state: no `ride:driver` record, no assigned
-key, nothing locked (phantom locks are released as usual). That has two
-consequences:
+An unmatched ride writes only its `ride:outcome` record: no assigned key. So a
+redelivered `ride.priced` for an unmatched ride stays unmatched, even if drivers
+have since been released, and publishes the same `ride.unmatched` again.
 
-- A redelivered `ride.priced` for an unmatched ride runs `Match` again, and
-  may now succeed if drivers have been released in the meantime. The ride
-  can then produce `ride.matched` after `ride.unmatched`.
-- assignment-service therefore treats matched as final: `ride.matched`
-  replaces an earlier unmatched record, a later `ride.unmatched` for a
-  matched ride is ignored (`unmatched_duplicates_total`), and so is a second
-  `ride.unmatched` for the same ride. `GET /rides/<id>` on
-  assignment-service reports whichever outcome is current.
+assignment-service ignores a second `ride.unmatched` for the same ride
+(`unmatched_duplicates_total`). It also treats matched as final, so a
+`ride.matched` replaces an earlier unmatched record. That shouldn't happen now
+unless the 10-minute record has expired.
 
 assignment-service counts unmatched rides in `unmatched_total{reason}` and
 `unmatched_end_to_end_latency_seconds`, separately from `assignments_total`
@@ -210,10 +178,9 @@ comparable. See the README.
 
 | Signal | Meaning |
 |---|---|
-| `match_idempotent_replays_total` | Matches answered from `ride:driver:<rideID>`. |
+| `match_idempotent_replays_total` | Matches answered from `ride:outcome:<rideID>`. |
 | `matching_success_total`, `matching_failures_total` | Match outcomes; failures rise when free drivers run out. |
-| `driver_lock_conflict_total` | Includes refusals of already-assigned drivers. |
-| `nearby_drivers_current`, `nearby_driver_count` | Free drivers visible to a pickup; falls as drivers become busy. |
+| `driver_claim_latency_seconds` | Time for one claim, as seen by the client. |
 | simulator log: `trips completed /sec` | Rate at which drivers return to the pool. |
 
 Redis spot checks:
@@ -221,11 +188,11 @@ Redis spot checks:
 ```bash
 redis-cli ZCARD drivers:locations          # free drivers (falls under load)
 redis-cli --scan --pattern 'driver:assigned:*' | wc -l   # busy drivers
-redis-cli GET ride:driver:<rideID>          # which driver a ride got
+redis-cli HGETALL ride:outcome:<rideID>     # what happened to a ride
 ```
 
 In steady state `ZCARD drivers:locations` plus the number of assigned keys
-should be about `DRIVER_COUNT` (locked drivers are still in the set).
+should be about `DRIVER_COUNT`.
 
 ---
 
@@ -236,8 +203,5 @@ should be about `DRIVER_COUNT` (locked drivers are still in the set).
 - **Phase 2 throughput work.** With drivers now busy for the trip duration,
   the saturation point of the ladder moves; the supply model is also a new
   tuning dimension (`DRIVER_COUNT` against `DRIVER_TRIP_DURATION`).
-- **Hard Redis time bounds** (`ContextTimeoutEnabled`), see section 4.
-- **Benchmark ladder must be re-run** before any number is compared with the
-  committed CSV. The matcher defaults (`MATCH_WORKERS` = `NumCPU × 25`,
-  `MATCH_DEADLINE` = 500 ms) are unmeasured, and the unmatched path has not
-  been exercised against real Kafka and Redis.
+- **Late announcements after a crash.** A claimed ride can be announced about
+  30 s late, possibly after its simulated trip ended. See the README.
