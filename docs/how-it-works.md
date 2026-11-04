@@ -6,7 +6,7 @@ This is the plain-language guide to the project: what it does, how each feature 
 
 RidePulse is the behind-the-scenes system of a ride-hailing app. When someone asks for a ride, it works out a fare, finds a nearby free driver, and makes sure that driver isn't given to anyone else.
 
-It's a backend only, with no app or map screen yet. Riders and drivers are simulated by small programs so the system can be put under heavy load.
+It's a backend with a live demo dashboard, not a rider or driver app. Riders and drivers are simulated by small programs so the system can be put under heavy load.
 
 ## The journey of one ride
 
@@ -33,7 +33,8 @@ The rider doesn't wait for steps 2 to 4. They get their ride ID straight away an
 | **Benchmark tool** | Raises the load step by step and records how the system copes | The stress tester |
 | **Kafka** | Carries messages between services and holds them until they're handled | A conveyor belt |
 | **Redis** | Fast shared memory for driver locations and who is busy | The dispatcher's whiteboard |
-| **Prometheus** | Collects measurements from every service | The dashboard's data source |
+| **Prometheus** | Collects measurements from every service, in the manual setup | The measurement archive |
+| **Dashboard** | Generates simulated rides and shows the whole system live | The control room |
 
 ## Features and how they work
 
@@ -116,7 +117,15 @@ GitHub CI runs `go vet`, `go build` and the tests for every module on each pull 
 
 ## Trying it out
 
-The README has the [full steps](../README.md#running-ridepulse). In short, start Kafka, Redis and Prometheus with Docker, start each service, then send load:
+Install Docker, clone the repo, then double-click `demo.bat` on Windows or run `./demo.sh`. The dashboard opens at http://localhost:8090, where you can:
+
+- **Move the slider** to change how many rides are requested each second.
+- **Press Rush hour** to send far more rides than drivers can serve. Drivers run out and surge climbs to 3×.
+- **Send a bad message** and see it moved to the dead-letter topic while everything else keeps running.
+- **Deliver a ride twice** and see the ride keep its driver, with the duplicate ignored.
+- **Crash matching** and see rides wait in its queue, usually for about 30 seconds, then all get processed.
+
+To run the services by hand, the README has the [full steps](../README.md#running-ridepulse). In that setup, you can send a single ride yourself:
 
 ```bash
 curl -X POST http://localhost:8080/rides -H "Content-Type: application/json" -d '{"pickup":{"lat":12.91,"lng":77.61},"drop":{"lat":12.97,"lng":77.59}}'
@@ -150,7 +159,6 @@ curl http://localhost:2114/rides/<ride_id>
 - **Silent drivers aren't detected.** A driver that stops sending updates stays in search results.
 - **There are no real riders or trips.** Requests have no rider identity or login, drivers can't accept or decline, and a trip is just a timer. There's no pickup, drop-off or cancelling.
 - **Each Kafka topic has one partition.** This limits how much work can run in parallel.
-- **No demo screen.** There's no map or dashboard to show someone.
 
 ## Glossary
 

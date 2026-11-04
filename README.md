@@ -9,6 +9,28 @@ Event-driven ride matching in Go: Kafka between every stage, Redis GEO for nearb
 ![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?logo=prometheus&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-2496ED?logo=docker&logoColor=white)
 
+## See it running
+
+![RidePulse dashboard: drivers on a map during a rush hour, with live rates, queues and surge pricing](assets/demo.gif)
+
+The dashboard shows the whole system on one page: a live map, each service's rate and Kafka queue, fares and surge. You can raise demand, trigger a rush hour, send a corrupt message, deliver a ride twice, or crash the matching service and watch it recover. Riders and drivers are simulated; the services, Kafka and Redis are real.
+
+**Run it yourself.** You need [Docker](https://www.docker.com/products/docker-desktop/), about 1 GB of free memory, and nothing else. Clone the repo, then double-click `demo.bat` on Windows, or run:
+
+```bash
+./demo.sh
+```
+
+Or start it directly, and open http://localhost:8090:
+
+```bash
+docker compose up -d --wait dashboard
+```
+
+The first run can take several minutes if it has to build the image. Stop it with `docker compose down`.
+
+The dashboard is only reachable from your machine. Its crash button needs access to Docker, and can only kill and restart the matching container.
+
 ## Results at a glance
 
 From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv)): one run on an 8-core Windows machine that also hosted Docker, Kafka, Redis and the load generator, with single-partition topics, 1,000 drivers and 5 s trips.
@@ -84,7 +106,8 @@ The `ride.*` payloads share one contract, [`pkg/events`](pkg/events/events.go): 
 | **Shared runtime** (`pkg/kafkaconsumer`, `pkg/health`) | At-least-once consumer runner with ordered commits and DLQs; liveness and readiness handlers |
 | **Kafka** | Decouples every stage of the pipeline |
 | **Redis** | GEO indexing and driver assignment state, with one Lua script performing each claim atomically |
-| **Prometheus** | Latency, contention, and success-rate monitoring at every stage |
+| **Prometheus** | Latency and success-rate monitoring at every stage |
+| **Dashboard** (demo only) | Generates simulated rides, reads Kafka, Redis and each service's metrics, and serves the live page |
 
 ---
 
@@ -259,6 +282,8 @@ Earlier locking work, since replaced: [phantom-lock fix](docs/phantom-lock-fix.m
 ---
 
 ## Running RidePulse
+
+To see it working, use the [demo](#see-it-running). The steps below run each service by hand, for development and benchmarking.
 
 ### Prerequisites
 
