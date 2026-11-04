@@ -129,7 +129,7 @@ func main() {
 		"unmatched_rps", "dlq_rps",
 		"e2e_p50_ms", "e2e_p95_ms", "e2e_p99_ms",
 		"gateway_p95_ms", "match_p95_ms",
-		"success_rate_pct",
+		"success_rate_pct", "surge_multiplier",
 	}
 	if err := w.Write(header); err != nil {
 		log.Fatal(err)
@@ -326,6 +326,8 @@ func (p *promClient) collect(step ladderStep, window time.Duration) []string {
 	gwP95 := p.queryOrLog(fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket[%s])))", w))
 	matchP95 := p.queryOrLog(fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(matching_latency_seconds_bucket[%s])))", w))
 
+	surge := p.queryOrLog("pricing_surge_multiplier")
+
 	var successRate float64
 	if actualRPS > 0 {
 		successRate = 100 * assignments / actualRPS
@@ -353,6 +355,7 @@ func (p *promClient) collect(step ladderStep, window time.Duration) []string {
 		fmt.Sprintf("%.0f", gwP95*1000),
 		fmt.Sprintf("%.0f", matchP95*1000),
 		fmt.Sprintf("%.1f", successRate),
+		fmt.Sprintf("%.1f", surge),
 	}
 }
 
