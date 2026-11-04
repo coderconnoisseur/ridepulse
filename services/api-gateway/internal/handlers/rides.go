@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -81,6 +82,7 @@ func CreateRide(publisher ports.EventPublisher) gin.HandlerFunc {
 			Drop:        toLocation(req.Drop),
 			RequestedAt: time.Now().UnixNano(),
 		}); err != nil {
+			log.Printf("publish ride.requested: %v", err)
 			metrics.PublishErrors.Inc()
 			c.JSON(503, gin.H{"error": "Failed to create ride."})
 			return

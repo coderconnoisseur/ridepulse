@@ -10,6 +10,12 @@ import (
 	"ridepulse/pkg/events"
 )
 
+// publishBatchWindow is how long the writer collects messages into a batch. It
+// must exceed a broker round trip: kafka-go closes batches on this timer but
+// sends them one at a time per partition, so a shorter window builds a queue
+// that grows without limit under load.
+const publishBatchWindow = 25 * time.Millisecond
+
 // KafkaPublisher writes ride.requested events. It hides the kafka-go writer
 // behind the EventPublisher port.
 type KafkaPublisher struct {
@@ -22,7 +28,7 @@ func NewKafkaPublisher(brokers []string) *KafkaPublisher {
 		Topic:        events.TopicRideRequested,
 		Balancer:     &kafka.Hash{}, // same ride ID always lands on the same partition
 		RequiredAcks: kafka.RequireOne,
-		BatchTimeout: 10 * time.Millisecond,
+		BatchTimeout: publishBatchWindow,
 		BatchSize:    100,
 		Async:        false,
 	}

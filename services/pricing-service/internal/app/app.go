@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	publishTimeout  = 300 * time.Millisecond
+	publishTimeout  = 2 * time.Second
 	shutdownTimeout = 5 * time.Second
 	readyTimeout    = 1 * time.Second
 )
