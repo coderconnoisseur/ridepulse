@@ -6,7 +6,7 @@ This is the plain-language guide to the project: what it does, how each feature 
 
 RidePulse is the behind-the-scenes system of a ride-hailing app. When someone asks for a ride, it works out a fare, finds a nearby free driver, and makes sure that driver isn't given to anyone else.
 
-It's a backend only, with no app or map screen. Riders and drivers are simulated by small programs so the system can be put under heavy load.
+It's a backend only, with no app or map screen yet. Riders and drivers are simulated by small programs so the system can be put under heavy load.
 
 ## The journey of one ride
 
@@ -14,8 +14,8 @@ Think of a relay race, where each service does one job and passes the ride on th
 
 1. **A rider asks for a ride.** A pickup and drop location arrive at the API gateway. It checks the coordinates are valid, gives the ride an ID, and replies "requested".
 2. **The ride gets a fare.** The pricing service calculates the price.
-3. **The ride gets a driver.** The matching service searches for nearby drivers, reserves one and assigns them.
-4. **The result is recorded.** The assignment service stores whether the ride was matched or not, and how long it took from start to finish.
+3. **The ride gets a driver.** The matching service finds the nearest free driver and assigns them in one step.
+4. **The result is recorded.** The assignment service stores whether the ride was matched or not, the fare, and how long it took from start to finish.
 5. **The driver finishes the trip.** After a set time, the simulated driver becomes free and starts appearing in searches again.
 
 The rider doesn't wait for steps 2 to 4. They get their ride ID straight away and can look up the result later.
@@ -43,7 +43,15 @@ The gateway rejects missing or impossible coordinates, such as a latitude of 200
 
 ### Calculating the fare
 
-The fare is ₹50 plus ₹12 per km. Distance is measured straight over the Earth's surface from pickup to drop, not along roads. There's a surge field, but it's always 1.0 for now.
+The fare is ₹50 plus ₹12 per km, multiplied by surge. Distance is measured straight over the Earth's surface from pickup to drop, not along roads. The fare stays with the ride all the way to the final result.
+
+### Surge pricing
+
+When more people want rides than there are free drivers, fares go up. Once a second, the pricing service compares rides requested in the last 5 seconds with drivers free right now.
+
+If demand is at or below supply, the multiplier is 1.0. Above that, it follows the ratio, up to 3.0. So 800 recent requests with 400 free drivers means 2.0.
+
+It applies to the whole city, not to separate areas. The simulated riders don't react to higher prices, so surge doesn't reduce demand here as it would in real life.
 
 ### Finding nearby drivers
 
@@ -63,7 +71,7 @@ Each attempt to claim a driver gets 500 ms. If it runs out of time, the attempt 
 
 ### Telling the system when no driver is found
 
-A ride that can't be matched isn't silently dropped. It's recorded as unmatched with the reason `no_drivers`.
+A ride that can't be matched isn't silently dropped. It's recorded as unmatched with the reason `no_drivers`, and that answer is final, so a rider told "no driver" won't suddenly be given one after a crash.
 
 ### Never losing a ride
 
@@ -71,7 +79,7 @@ A service only marks a message as done after it has been handled. If a service c
 
 ### Handling duplicates safely
 
-If a ride that already has a driver arrives again, the matching service returns the same driver instead of assigning a second one. The assignment service also counts each ride only once.
+If a ride arrives again, the matching service returns the same result as the first time, instead of assigning a second driver. The assignment service also counts each ride only once.
 
 ### Handling messages that keep failing
 
@@ -124,18 +132,23 @@ curl http://localhost:2114/rides/<ride_id>
 
 **Not yet proven**
 
-- **No automated test with real Kafka and Redis.** The main flows were checked by hand on a live stack, but nothing repeats those checks automatically.
+- **No automated test with real Kafka and Redis.** The main flows were checked on a live stack, including force-killing services under load, but nothing in the repo repeats those checks automatically.
 - **Performance comes from one run on one machine.** It accepted about 1,500 requests per second, and every ride got a result. Matched rides levelled off at about 160 per second because the 1,000 simulated drivers are busy for 5 seconds per trip.
 - **The true top speed isn't known.** Things slow down near 1,500 requests per second, but the services, Docker and the load generator all shared one machine, so that may be the machine's limit.
 
+**Known weak spots**
+
+- **News can arrive late after a crash.** A ride that got a driver just before a crash is announced after the restart, about 30 seconds later in testing.
+- **A ride can be quoted twice.** If the pricing service crashes and surge changes, a redelivered ride can get a second price. The first recorded result stands.
+- **Dead-lettered rides get no answer.** Nothing tells the rider or tries again.
+
 **Not built yet**
 
-- **No surge pricing.** The multiplier is always 1.0.
-- **Riders can't see their fare.** The price is calculated, but it isn't passed on to the final ride result.
 - **Results are kept in memory.** Restarting the assignment service loses them. Lookups also go to that service directly, not through the gateway.
-- **The search area is fixed.** It's always 50 km and doesn't grow when nearby drivers are scarce.
+- **The search area is fixed.** It's always 50 km, so a driver that far away can be matched, and it doesn't adapt to how scarce drivers are.
+- **Surge is simple.** It has no zones, and it isn't based on road distance or travel time.
 - **Silent drivers aren't detected.** A driver that stops sending updates stays in search results.
-- **Rides stop at "matched".** There's no pickup, trip or completion step for a ride, and no cancelling.
+- **There are no real riders or trips.** Requests have no rider identity or login, drivers can't accept or decline, and a trip is just a timer. There's no pickup, drop-off or cancelling.
 - **Each Kafka topic has one partition.** This limits how much work can run in parallel.
 - **No demo screen.** There's no map or dashboard to show someone.
 

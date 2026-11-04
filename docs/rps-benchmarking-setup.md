@@ -1,10 +1,5 @@
 # RPS Benchmarking Setup — RidePulse
 
-> **Status:** local-only note. Not intended for the public repo.
-> Documents everything that had to change so the pipeline could be
-> loaded and measured honestly, plus how to actually run a benchmark
-> and interpret the results.
-
 ---
 
 ## 1. What was blocking a real RPS benchmark
@@ -264,6 +259,7 @@ end-to-end p99 breaches your SLO — that's the ceiling.
 | `e2e_p{50,95,99}_ms`      | `histogram_quantile` on `end_to_end_latency_seconds_bucket`, in ms      |
 | `gateway_p95_ms`          | `histogram_quantile(0.95)` on `gateway_request_duration_seconds`, in ms |
 | `match_p95_ms`            | `histogram_quantile(0.95)` on `matching_latency_seconds`, in ms         |
+| `surge_multiplier`        | `pricing_surge_multiplier` at the end of the window                     |
 | `success_rate_pct`        | `100 × assignments_rps / actual_rps_in`, clamped to 100                 |
 
 #### Manual run (if you don't want the CSV)

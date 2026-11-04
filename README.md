@@ -13,10 +13,11 @@ Event-driven ride matching in Go: Kafka between every stage, Redis GEO for nearb
 
 From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv)): one run on an 8-core Windows machine that also hosted Docker, Kafka, Redis and the load generator, with single-partition topics, 1,000 drivers and 5 s trips.
 
-- **Accepts about 1,500 RPS:** the gateway held every target up to 1,200 RPS and accepted 1,543 RPS at a 1,600 target, with no publish errors in any measurement window.
-- **Every ride gets a result:** all 211,750 requests ended matched or unmatched. None reached a dead-letter topic and no backlog remained.
-- **Fast under load:** end-to-end p95 was 259 ms at 800 RPS, and about 1 s at the top step.
-- **Matched rides are limited by driver supply:** about 160/sec with these settings. With 1 s trips, a separate run reached about 450/sec.
+- **Accepts about 1,500 RPS:** the gateway held targets up to 800 RPS and accepted 1,569 RPS at a 1,600 target, with no publish errors in any measurement window.
+- **Every ride gets one outcome:** all 212,751 requests ended matched or unmatched. None reached a dead-letter topic and no backlog remained.
+- **Fast under load:** end-to-end p95 for matched rides was 190 ms at 800 RPS, and about 1.1 s at the top step.
+- **Matched rides are limited by driver supply:** about 160/sec with these settings, so most rides at high load are recorded as unmatched. That's expected, not an error. With 1 s trips, a separate earlier run reached about 450/sec.
+- **Guarantees hold through crashes:** with matching and pricing force-killed under load, no ride was lost, none got two drivers, and no driver had overlapping rides ([details](docs/matching-under-load.md#live-audit-of-the-guarantees)).
 
 **Core focus areas:**
 - Low-latency geospatial matching
@@ -35,7 +36,7 @@ flowchart LR
     RS["rider-simulator<br/>load generator"] -->|"HTTP POST /rides"| GW["api-gateway"]
     GW -->|"produce"| T1[["ride.requested"]]
     T1 -->|"group pricing-service"| PR["pricing-service"]
-    PR -->|"produce"| T2[["ride.priced"]]
+    PR -->|"produce, with fare"| T2[["ride.priced"]]
     T2 -->|"group matching-service"| MS["matching-service"]
     MS -->|"produce, on match"| T3[["ride.matched"]]
     MS -->|"produce, on failure"| T4[["ride.unmatched"]]
@@ -50,13 +51,16 @@ flowchart LR
     subgraph Redis
         GEO[("drivers:locations<br/>GEO index")]
         BUSY[("driver:assigned:{id}<br/>10 min safety TTL")]
-        RIDE[("ride:driver:{rideID}<br/>1 h idempotency record")]
+        RIDE[("ride:outcome:{rideID}<br/>the ride's final outcome, 1 h or 10 min")]
     end
     MS -->|"one atomic claim: nearest free driver within 50 km"| GEO
     MS -->|"same script: set busy, ZREM"| BUSY
-    MS -->|"same script: record ride"| RIDE
+    MS -->|"same script: record outcome"| RIDE
+    PR -->|"count free drivers, once a second, for surge"| GEO
     DS["driver-simulator"] -->|"GEOADD while not busy"| GEO
     DS -->|"release after DRIVER_TRIP_DURATION"| BUSY
+
+    CLIENT["any client"] -->|"GET /rides/{id}"| AS
 
     PROM[("Prometheus")] -.->|"scrape /metrics"| GW
     PROM -.-> PR
@@ -72,9 +76,9 @@ The `ride.*` payloads share one contract, [`pkg/events`](pkg/events/events.go): 
 |---|---|
 | **Rider Simulator** | Generates ride requests at configurable RPS against the HTTP gateway |
 | **API Gateway** | Accepts `POST /rides`, publishes `ride.requested` to Kafka |
-| **Pricing Service** | Consumes `ride.requested`, computes fare, publishes `ride.priced`; failures retried, then dead-lettered to `ride.requested.dlq` |
-| **Matching Service** | Consumes `ride.priced`, atomically claims the nearest free driver (idempotent per ride), publishes `ride.matched`; if no driver is free, publishes `ride.unmatched` with reason `no_drivers`; infrastructure failures retried, then dead-lettered to `ride.priced.dlq` |
-| **Assignment Service** | Consumes `ride.matched` and `ride.unmatched`, records each ride's outcome once (duplicates ignored), exposes end-to-end latency metrics and `GET /rides/<id>`; dead-letters to `ride.matched.dlq` / `ride.unmatched.dlq` |
+| **Pricing Service** | Consumes `ride.requested`, computes the fare with city-wide surge, publishes `ride.priced`; failures retried, then dead-lettered to `ride.requested.dlq` |
+| **Matching Service** | Consumes `ride.priced`, atomically decides the ride's outcome once (nearest free driver or no driver), publishes `ride.matched` with the fare, or `ride.unmatched` with reason `no_drivers`; infrastructure failures retried, then dead-lettered to `ride.priced.dlq` |
+| **Assignment Service** | Consumes `ride.matched` and `ride.unmatched`, records each ride's outcome and fare once (duplicates ignored), exposes end-to-end latency metrics and `GET /rides/<id>`; outcomes are kept in memory; dead-letters to `ride.matched.dlq` / `ride.unmatched.dlq` |
 | **Driver Simulator** | Continuously updates live driver locations in Redis GEO; keeps assigned drivers out of the GEO set and releases them after `DRIVER_TRIP_DURATION` |
 | **Event contracts** (`pkg/events`) | Shared snake_case JSON types for `ride.requested`, `ride.priced`, `ride.matched` and `ride.unmatched`; every service imports them instead of keeping its own copy |
 | **Shared runtime** (`pkg/kafkaconsumer`, `pkg/health`) | At-least-once consumer runner with ordered commits and DLQs; liveness and readiness handlers |
@@ -104,16 +108,16 @@ sequenceDiagram
     GW->>Kafka: ride.requested, rider gets 503 if this fails
     GW-->>Rider: 201 {ride_id, status REQUESTED}
     Kafka->>Pricing: ride.requested
-    Pricing->>Kafka: ride.priced {price, currency, surge}
+    Pricing->>Kafka: ride.priced {price, currency, surge multiplier}
     Kafka->>Match: ride.priced
     Match->>Redis: claim script: nearest free driver within 50 km
     Note over Match,Redis: one atomic step, so rides cannot collide
     alt a free driver is in range
-        Redis-->>Match: driver (driver:assigned and ride:driver set, removed from GEO)
-        Match->>Kafka: ride.matched
+        Redis-->>Match: driver (driver:assigned and ride:outcome set, removed from GEO)
+        Match->>Kafka: ride.matched {driver, claim time, fare}
         Kafka->>Assign: ride.matched
         Assign->>Assign: record the matched outcome once
-    else no free driver in range
+    else no free driver in range, recorded as final
         Match->>Kafka: ride.unmatched {reason}
         Kafka->>Assign: ride.unmatched
         Assign->>Assign: record the unmatched outcome once
@@ -126,8 +130,6 @@ Latency is measured from `requested_at` (stamped at the gateway) to the terminal
 
 ---
 
----
-
 ## Core Engineering Decisions
 
 ### 1. Geospatial Indexing with Redis GEO
@@ -136,7 +138,7 @@ Driver locations are stored and queried using Redis's native GEO commands, enabl
 
 ### 2. Atomic driver claim
 
-One Lua script finds the nearest free driver within 50 km, marks them busy, records the ride and removes them from the GEO set in a single step. Redis runs scripts one at a time, so two rides can't collide over a driver, and each ride costs one Redis call.
+One Lua script decides each ride's outcome once. It finds the nearest free driver within 50 km by straight-line distance, marks them busy, records the outcome and removes them from the GEO set in a single step. If no driver is free, it records that too. Redis runs scripts one at a time, so two rides can't collide over a driver, each ride costs one Redis call, and a redelivered ride always gets the same outcome.
 
 This replaced a design of per-driver locks, parallel batches and phantom-lock release, after measurements showed it was the bottleneck: about 298,000 lock attempts for 5,905 matches in one run. It needs a single Redis instance, not Redis Cluster.
 
@@ -144,7 +146,7 @@ Full write-up: [matching-under-load.md](docs/matching-under-load.md).
 
 ### 3. Kafka batch window above the broker round trip
 
-`kafka-go` closes batches on a timer and sends them one at a time per partition. A window shorter than a broker round trip builds a queue that grows under load, which caused publish timeouts, duplicates and dead letters. The window is now 25 ms with a 2 s publish budget. The cost is higher latency at low load: median end-to-end latency at 50 RPS rose from 40 ms to 91 ms.
+`kafka-go` closes batches on a timer and sends them one at a time per partition. A window shorter than a broker round trip builds a queue that grows under load, which caused publish timeouts, duplicates and dead letters. The window is now 25 ms with a 2 s publish budget. The cost is higher latency at low load: median end-to-end latency at 50 RPS rose from 40 ms to about 85 ms.
 
 ### 4. At-least-once consumers with ordered commits and DLQs
 
@@ -154,21 +156,29 @@ Full write-up: [at-least-once-consumers.md](docs/at-least-once-consumers.md).
 
 ### 5. Driver state model and idempotent matching
 
-A matched driver is now genuinely busy: matching atomically sets `driver:assigned:<id>`, writes `ride:driver:<rideID>` and removes the driver from the GEO set; the driver simulator ends the trip after `DRIVER_TRIP_DURATION` (default `5s`). Because the claim first checks `ride:driver:<rideID>`, a retry or Kafka redelivery returns the same driver instead of assigning a second one.
+A matched driver is genuinely busy: the claim script sets `driver:assigned:<id>`, writes `ride:outcome:<rideID>` and removes the driver from the GEO set; the driver simulator ends the trip after `DRIVER_TRIP_DURATION` (default `5s`). Because the script first checks `ride:outcome:<rideID>`, a retry or Kafka redelivery gets the same result: the same driver with the original claim time, or no driver.
 
 Full write-up: [driver-state-model.md](docs/driver-state-model.md).
 
-### 6. Worker Pool with Bounded Concurrency
+### 6. Fares and surge
+
+The fare is `(₹50 + ₹12 × km) × surge`, rounded to paise. Distance is the straight line between pickup and drop (haversine), not the road distance. The fare travels on `ride.priced` and `ride.matched`, so `GET /rides/<id>` can show it.
+
+Surge is city-wide, with no zones. Once a second, pricing compares rides requested in the last 5 s with drivers free right now. It stays at 1.0 until demand exceeds supply, then follows the ratio in steps of 0.1, up to 3.0. If Redis can't be reached, riders pay the normal fare. Pricing a ride never waits on Redis.
+
+The simulated riders don't react to price, so surge here doesn't reduce demand as it would in a real market.
+
+### 7. Worker Pool with Bounded Concurrency
 
 The shared consumer runner (`pkg/kafkaconsumer`) hands each fetched message to a fixed number of workers over an unbuffered channel. This provides natural backpressure — if handlers fall behind, fetching blocks rather than spawning unbounded goroutines or buffering messages, preventing memory blowup under load spikes.
 
-### 7. Observability-Driven Tuning
+### 8. Observability-Driven Tuning
 
 Every stage exposes Prometheus metrics on its own port. `RequestedAt` is stamped at the api-gateway and propagated through every event so the terminal consumer can measure true end-to-end latency, not just per-stage latency.
 
 Key exports:
 - `gateway_request_duration_seconds`, `gateway_requests_total`, `gateway_publish_errors_total`
-- `pricing_processing_duration_seconds`, `pricing_events_published_total`
+- `pricing_processing_duration_seconds`, `pricing_events_published_total`, `pricing_surge_multiplier`
 - `matching_latency_seconds`, `matching_success_total`, `matching_failures_total`, `match_unmatched_published_total{reason}`
 - `driver_claim_latency_seconds`
 - `end_to_end_latency_seconds`, `assignments_total` (each ride counted once), `assignment_duplicates_total`
@@ -186,16 +196,16 @@ The latest run is committed here:
 
 📊 **[tools/benchmark/benchmark-results.csv](tools/benchmark/benchmark-results.csv)**
 
-| Target RPS | Gateway intake | Matched/sec | Unmatched/sec | E2E p50 | E2E p95 | DLQ/sec |
+| Target RPS | Gateway intake | Matched/sec | Unmatched/sec | E2E p50 | E2E p95 | Surge at end of step |
 |---|---|---|---|---|---|---|
-| 50 | 50 | 50 | 0 | 91 ms | 191 ms | 0 |
-| 100 | 100 | 100 | 0 | 77 ms | 144 ms | 0 |
-| 200 | 200 | 158 | 42 | 86 ms | 184 ms | 0 |
-| 300 | 300 | 160 | 140 | 82 ms | 178 ms | 0 |
-| 500 | 500 | 160 | 340 | 83 ms | 181 ms | 0 |
-| 800 | 800 | 160 | 636 | 101 ms | 259 ms | 0 |
-| 1,200 | 1,199 | 160 | 1,039 | 232 ms | 612 ms | 0 |
-| 1,600 | 1,543 | 160 | 1,360 | 516 ms | 1,037 ms | 0 |
+| 50 | 50 | 50 | 0 | 85 ms | 188 ms | 1.0 |
+| 100 | 100 | 100 | 0 | 80 ms | 174 ms | 1.2 |
+| 200 | 200 | 157 | 43 | 84 ms | 185 ms | 3.0 |
+| 300 | 300 | 160 | 141 | 85 ms | 183 ms | 3.0 |
+| 500 | 500 | 159 | 341 | 94 ms | 190 ms | 3.0 |
+| 800 | 800 | 160 | 641 | 100 ms | 190 ms | 3.0 |
+| 1,200 | 1,184 | 160 | 1,027 | 166 ms | 362 ms | 3.0 |
+| 1,600 | 1,569 | 155 | 1,417 | 218 ms | 1,105 ms | 3.0 |
 
 End-to-end latency covers matched rides. Matched rides level off because each driver is busy for a 5 s trip, so unmatched rides above that rate are expected. This is a single run on a shared machine, so treat the numbers as indicative. [matching-under-load.md](docs/matching-under-load.md) explains how the first live run's collapse at 800 RPS was diagnosed and fixed.
 
@@ -206,14 +216,19 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 ## Known limitations and next steps
 
 - **Limits at the top of the ladder aren't isolated.** Gateway p95 rises and intake falls short of target near 1,500 RPS. Everything shares one machine, so it may be the machine rather than the code.
-- **Higher latency at low load.** The 25 ms batch window adds time at each Kafka hop, so median end-to-end latency is about 80-90 ms even when idle.
-- **A single Redis instance is required.** The claim script builds key names at runtime, so it won't run on Redis Cluster as written.
-- **A brief startup burst of claim timeouts.** While the Redis connection pool warms up, some claims can hit the 500 ms timeout. They are retried safely.
+- **Higher latency at low load.** The 25 ms batch window adds time at each Kafka hop, so median end-to-end latency is about 80-85 ms even when idle.
+- **A single Redis instance is required.** The claim script builds key names at runtime, so it won't run on Redis Cluster as written. Ride outcomes live only in Redis, so losing Redis data would also lose duplicate protection.
+- **A rider can hear about a driver late after a crash.** A ride claimed just before a crash is announced after the restart, about 30 s later in testing, and possibly after the simulated trip has ended. `matched_at` shows the true claim time, but the late announcement remains.
+- **A redelivered ride can be quoted twice.** If pricing crashes, a redelivered ride can get a second price when surge has changed. The first result recorded by assignment-service stands.
+- **A dead-lettered ride has no outcome.** If a ride reaches `ride.priced.dlq`, nothing tells the rider or replays it. If it had already claimed a driver, that driver makes a simulated trip for nobody.
+- **Matching is simple.** A driver up to 50 km away can be matched, the radius is fixed, and distance is straight-line. There's no ETA, rating, or accept/decline.
+- **There are no riders or trips as such.** Requests have no rider identity or login, the gateway has no rate limiting, and a trip is a timer: drivers don't move to the pickup or drop.
+- **The event version isn't enforced.** Events carry `v`, but consumers don't check it yet.
 - **Single-partition Kafka topics.** One partition per topic caps consumer parallelism per service. Next: create topics with more partitions, partition by ride ID and run multiple consumers per stage. Until then the rewind handling below is not exercised.
 - **Rewind detection is partial.** The offset tracker detects a rewind only when a re-fetched offset is at or below the last offset it tracked. A partition re-assigned starting *above* that offset is not detected, so the committed offset can move backwards and messages are redelivered. That stays within at-least-once, and handlers absorb duplicates.
 - **Two readers, two consumer groups.** assignment-service reads `ride.matched` in group `assignment-service` and `ride.unmatched` in group `assignment-service-unmatched`. A shared group would make the leader's metadata request for both topics fail as a whole while `ride.unmatched` does not exist yet (it is created lazily on the first business failure), stalling the success path too; with separate groups a missing `ride.unmatched` topic only delays the unmatched reader, and rebalances are independent.
 - **In-memory assignment store.** The assignment service keeps ride outcomes (matched and unmatched) in maps for benchmark verification; nothing is persisted, so after a restart a redelivered event is counted as new.
-- **Test coverage is unit-level.** Unit tests cover the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), the driver claim script (nearest-first, replay, concurrent claims) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes. No automated test uses real Kafka or Redis. The matched and unmatched paths, dead-lettering, duplicate handling, driver release and restart recovery were checked by hand against a live stack, but consumer-group rewinds weren't. Next: integration tests against containerized Kafka and Redis.
+- **Test coverage is unit-level.** Unit tests cover the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), surge rules, and the driver claim script (nearest-first, replay, final outcomes, concurrent claims) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes. No automated test uses real Kafka or Redis. The matched and unmatched paths, dead-lettering, duplicate handling, driver release and crash recovery were checked against a live stack with scripts that aren't in the repo, and consumer-group rewinds weren't covered. Next: integration tests against containerized Kafka and Redis.
 - **Readiness probes are shallow.** `/ready` checks that a broker accepts a TCP connection (and Redis answers `PING`). It does not verify that the topics exist or that consumer groups are assigned partitions.
 
 ---
@@ -301,7 +316,7 @@ Confirm all four are `up` at http://localhost:9090/targets.
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
 | `KAFKA_BROKERS` | `localhost:9092` | api-gateway, pricing, matching, assignment | Comma-separated broker list. |
-| `REDIS_ADDR` | `localhost:6379` | matching, driver-simulator | Redis address. |
+| `REDIS_ADDR` | `localhost:6379` | pricing, matching, driver-simulator | Redis address. |
 | `HTTP_ADDR` | `:8080` (api-gateway), `:2114` (assignment) | api-gateway, assignment | HTTP listen address (also serves `/metrics`). |
 | `METRICS_ADDR` | `:2115` (pricing), `:2112` (matching) | pricing, matching | Metrics listen address. |
 | `MATCH_WORKERS` | `runtime.NumCPU() * 25` | matching | Matcher worker-pool size; positive integer. |
@@ -350,6 +365,9 @@ histogram_quantile(0.95, sum by (le) (rate(end_to_end_latency_seconds_bucket[1m]
 # Driver claim latency
 histogram_quantile(0.95, sum by (le) (rate(driver_claim_latency_seconds_bucket[1m])))
 
+# Current surge multiplier
+pricing_surge_multiplier
+
 # Rides that found no driver
 sum by (reason) (rate(unmatched_total[1m]))
 ```
@@ -362,7 +380,7 @@ curl http://localhost:2114/assignments/<id> # look up a matched ride (404 if unm
 curl http://localhost:2114/rides/<id>       # outcome of any ride: matched or unmatched
 ```
 
-`GET /rides/<id>` returns `{"ride_id","status":"matched","driver_id","matched_at","latency_ms"}` or `{"ride_id","status":"unmatched","reason","failed_at"}` (`reason` is `no_drivers`), and 404 for a ride with no outcome yet.
+`GET /rides/<id>` returns `{"ride_id","status":"matched","driver_id","matched_at","latency_ms","price","currency","surge_multiplier"}` or `{"ride_id","status":"unmatched","reason","failed_at"}` (`reason` is `no_drivers`), and 404 for a ride with no outcome yet. `matched_at` is when the driver was claimed.
 
 ### 5. Run the checks CI runs
 

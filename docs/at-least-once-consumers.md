@@ -1,11 +1,5 @@
 # At-Least-Once Consumers — pricing, matching, assignment
 
-> **Status:** local-only note. Not intended for the public repo.
-> Documents the offset-commit and failure-handling bug shared by the three
-> Kafka consumers, the shared runner that replaced it
-> (`pkg/kafkaconsumer`), the epoch mechanism that handles consumer-group
-> rewinds, handler panic recovery, and what is still not covered.
-
 ---
 
 ## 1. The bug in one paragraph
@@ -251,7 +245,7 @@ error.
   before the 1 s commit flush redelivers the message, as does a rewind
   (3f). Pricing is a pure function plus a publish, so a duplicate
   `ride.priced` is harmless to pricing itself but flows downstream. Matching
-  deduplicates by ride through `ride:driver:<rideID>`. Assignment-service
+  deduplicates by ride through `ride:outcome:<rideID>`. Assignment-service
   deduplicates in its store: the first `ride.matched` for a ride is recorded
   and counted in `assignments_total` and `end_to_end_latency_seconds`; later
   ones only increment `assignment_duplicates_total`. A ride has one outcome:

@@ -68,44 +68,49 @@ A replay means matching saw a ride that already had a driver, usually a retry af
 
 ## Live audit of the guarantees
 
-Two runs compared the raw Kafka topics event by event, using an independent script.
+An independent script compared the raw Kafka topics event by event, in a run at 300 RPS with matching and pricing each force-killed under load.
 
-| Check | 500 RPS for 60 s, no crashes | 300 RPS with matching and pricing each force-killed |
+| Check | Before the fixes below | After |
 |---|---|---|
-| Rides requested | 29,343 | 21,428 |
+| Rides requested | 21,428 | 20,018 |
 | Rides with no outcome | 0 | 0 |
 | Rides given two different drivers | 0 | 0 |
-| Smallest gap between one driver's matches | 5 s | 0 s (see below) |
-| Rides with both an unmatched and a matched result | 0 | 32 |
-| Fare differs from an independent calculation | No (29,343 checked) | No (21,482 event copies checked) |
+| Smallest gap between one driver's matches (trip is 5 s) | 0 s, misleading | 5 s |
+| Rides told "no driver" and then matched | 32 | 0 |
+| Fare differs from an independent calculation | No | No (20,377 checked) |
+| `ride.matched` fare differs from `ride.priced` | Not carried | No (4,311 checked) |
 
-**The crash run exposed two real weaknesses:**
+A clean run at 500 RPS for 60 s, before the fixes, also showed no lost rides and a smallest gap of 5 s across 8,932 repeat trips.
 
-- **A rider can hear about a driver late.** In 12 cases, two rides showed the same driver less than 4 s apart, both about 30 s after being requested. The evidence points to late notification rather than double-booking: 14 rides were claimed before the crash but announced only after the restart, by which time their driver's trip had ended and another ride could claim them. `matched_at` records when the event is published, not when the driver was claimed. This wasn't proven pair by pair.
-- **A rider can be told "no driver" and then get one.** If matching crashes after publishing `ride.unmatched` but before committing, the redelivered ride can match. The assignment service treats matched as final, but a driver is taken for a ride already reported as failed.
+**Two weaknesses the first audit exposed, both fixed:**
+
+- **`matched_at` recorded the wrong time.** It was the publish time, so a ride claimed before a crash and announced after it looked like it overlapped its driver's next ride. It's now the claim time, kept across replays, and the apparent overlaps are gone. The announcement itself can still be late, about 30 s in this run.
+- **A rider could be told "no driver" and then get one.** If matching crashed after publishing `ride.unmatched` but before committing, the redelivered ride could take a driver. The claim script now records "no driver" as the ride's final outcome, for 10 minutes.
+
+**Still open:** a ride priced again after a pricing crash can get a different quote if surge has changed (359 rides in this run). The first result recorded by the assignment service stands.
 
 ## Results
 
-Benchmark ladder with 1,000 drivers and 5 s trips. Full data: [`benchmark-results.csv`](../tools/benchmark/benchmark-results.csv).
+Final benchmark ladder with 1,000 drivers and 5 s trips. Full data: [`benchmark-results.csv`](../tools/benchmark/benchmark-results.csv).
 
-| Target RPS | Gateway intake | Matched/sec | Unmatched/sec | E2E p50 | E2E p95 | DLQ/sec |
+| Target RPS | Gateway intake | Matched/sec | Unmatched/sec | E2E p50 | E2E p95 | Surge at end of step |
 |---|---|---|---|---|---|---|
-| 50 | 50 | 50 | 0 | 91 ms | 191 ms | 0 |
-| 100 | 100 | 100 | 0 | 77 ms | 144 ms | 0 |
-| 200 | 200 | 158 | 42 | 86 ms | 184 ms | 0 |
-| 300 | 300 | 160 | 140 | 82 ms | 178 ms | 0 |
-| 500 | 500 | 160 | 340 | 83 ms | 181 ms | 0 |
-| 800 | 800 | 160 | 636 | 101 ms | 259 ms | 0 |
-| 1,200 | 1,199 | 160 | 1,039 | 232 ms | 612 ms | 0 |
-| 1,600 | 1,543 | 160 | 1,360 | 516 ms | 1,037 ms | 0 |
+| 50 | 50 | 50 | 0 | 85 ms | 188 ms | 1.0 |
+| 100 | 100 | 100 | 0 | 80 ms | 174 ms | 1.2 |
+| 200 | 200 | 157 | 43 | 84 ms | 185 ms | 3.0 |
+| 300 | 300 | 160 | 141 | 85 ms | 183 ms | 3.0 |
+| 500 | 500 | 159 | 341 | 94 ms | 190 ms | 3.0 |
+| 800 | 800 | 160 | 641 | 100 ms | 190 ms | 3.0 |
+| 1,200 | 1,184 | 160 | 1,027 | 166 ms | 362 ms | 3.0 |
+| 1,600 | 1,569 | 155 | 1,417 | 218 ms | 1,105 ms | 3.0 |
 
-E2E covers matched rides. Over the whole run, all 211,750 requests got a recorded result (52,608 matched, 159,142 unmatched), and none reached a dead-letter topic or stayed queued.
+E2E covers matched rides. Over the whole run, all 212,751 requests got an outcome (52,618 matched, 160,133 unmatched), and none reached a dead-letter topic or stayed queued. 50 of those requests were counted as gateway errors because the client disconnected, most likely when the load generator stopped between steps. The events had still gone through.
 
 **What limits it now:**
 
 - **Matched rides are limited by drivers.** Each driver is busy for a 5 s trip and returns on a 500 ms update tick, which fits the flat 160/sec. A separate 45 s run with 1 s trips reached about 450 matched/sec with no backlog.
-- **Intake starts to strain near 1,500 RPS.** Gateway p95 reached 362 ms at the top step, and intake fell short of the 1,600 target. Everything shared one machine with Docker and a browser, so this may be a limit of the machine rather than the code.
+- **Intake starts to strain near 1,500 RPS.** Gateway p95 reached 339 ms at the top step, and intake fell short of the 1,600 target. Everything shared one machine with Docker and a browser, so this may be a limit of the machine rather than the code.
 
-**The cost:** at 50 RPS, median end-to-end latency rose from 40 ms to 91 ms because of the longer batch window, in exchange for stability under load.
+**The cost:** at 50 RPS, median end-to-end latency rose from 40 ms to about 85 ms because of the longer batch window, in exchange for stability under load.
 
 **Limits of this evidence:** these numbers come from single runs on one shared machine, so treat them as indicative. Topics still have one partition.
