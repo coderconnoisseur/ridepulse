@@ -366,10 +366,10 @@ func formatDuration(d time.Duration) string {
 // printStepSummary writes a compact human-readable summary of the row that
 // was just recorded.
 func printStepSummary(step int, ls ladderStep, row []string) {
-	// row layout matches the CSV columns MINUS the leading "step" column.
+	// row layout matches the CSV columns, including the leading "step" column.
 	log.Printf(
 		"step %d done: target=%d rps → in=%s rps, assign=%s rps (success=%s%%), e2e p95=%s ms, match p95=%s ms, lock_conflicts=%s/s, phantom_rel=%s/s",
 		step, ls.rps,
-		row[2], row[3], row[14], row[10], row[13], row[7], row[8],
+		row[3], row[4], row[15], row[11], row[14], row[8], row[9],
 	)
 }
