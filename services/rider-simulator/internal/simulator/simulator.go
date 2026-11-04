@@ -37,7 +37,7 @@ type Simulator struct {
 
 // maxIdleConns covers the highest concurrency the benchmark ladder uses. The
 // default of 2 idle connections per host would open a new TCP connection for
-// most requests and, at high RPS, exhaust ephemeral ports through TIME_WAIT.
+// most requests, and at high RPS the gateway starts refusing connections.
 const maxIdleConns = 1000
 
 func New(url string) *Simulator {

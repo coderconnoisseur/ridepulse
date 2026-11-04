@@ -17,13 +17,13 @@ Every experiment held 800 RPS for 45 s on a clean stack, sampling per-process CP
 
 A replay means matching saw a ride that already had a driver, usually a retry after a publish timed out. The backlog shows matching couldn't keep up until the claim change. It grew in row 3, but this data doesn't isolate why.
 
-## Cause 1: the load generator ran out of ports
+## Cause 1: the load generator overwhelmed the gateway with new connections
 
 **Symptom:** intake collapsed to 45 RPS at the 800 RPS step.
 
-**Evidence:** `TIME_WAIT` sockets reached 16,279, close to Windows' default range of about 16,384 ephemeral ports. Kafka writes were still taking 20-35 ms.
+**Evidence:** `rider-simulator` never read response bodies and kept Go's default of 2 idle connections per host, so most requests opened a new TCP connection. Putting that behaviour back against the final services brought the collapse back, with intake dipping as low as 4 RPS. The error was `No connection could be made because the target machine actively refused it`. Kafka writes were still fast.
 
-**Cause:** `rider-simulator` never read response bodies and kept Go's default of 2 idle connections per host, so most requests opened a new TCP connection.
+**Cause:** the connection churn is confirmed, because changing only that fixes the collapse. Why connections were refused is less certain. The likely reason is the gateway's accept queue overflowing, which wasn't measured directly. An earlier version of this note blamed running out of ports, which was wrong: `TIME_WAIT` reached about 16,000, but this machine has 64,511 ports available.
 
 **Fix:** read each body to the end and allow 1,000 idle connections. `TIME_WAIT` fell to about 15 and rider errors to 0, with no change to the services.
 
@@ -65,6 +65,24 @@ A replay means matching saw a ride that already had a driver, usually a retry af
 - **Pricing capped the pipeline.** Its 8 workers each wait on a Kafka write. The default is now `NumCPU * 25`, set with `PRICING_WORKERS`.
 - **Gateway publish errors weren't logged.** They are now.
 - **`no_drivers` was misleading.** It also covered drivers that were only locked for a moment. It now means no free driver was in range.
+
+## Live audit of the guarantees
+
+Two runs compared the raw Kafka topics event by event, using an independent script.
+
+| Check | 500 RPS for 60 s, no crashes | 300 RPS with matching and pricing each force-killed |
+|---|---|---|
+| Rides requested | 29,343 | 21,428 |
+| Rides with no outcome | 0 | 0 |
+| Rides given two different drivers | 0 | 0 |
+| Smallest gap between one driver's matches | 5 s | 0 s (see below) |
+| Rides with both an unmatched and a matched result | 0 | 32 |
+| Fare differs from an independent calculation | No (29,343 checked) | No (21,482 event copies checked) |
+
+**The crash run exposed two real weaknesses:**
+
+- **A rider can hear about a driver late.** In 12 cases, two rides showed the same driver less than 4 s apart, both about 30 s after being requested. The evidence points to late notification rather than double-booking: 14 rides were claimed before the crash but announced only after the restart, by which time their driver's trip had ended and another ride could claim them. `matched_at` records when the event is published, not when the driver was claimed. This wasn't proven pair by pair.
+- **A rider can be told "no driver" and then get one.** If matching crashes after publishing `ride.unmatched` but before committing, the redelivered ride can match. The assignment service treats matched as final, but a driver is taken for a ride already reported as failed.
 
 ## Results
 
