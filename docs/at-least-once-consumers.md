@@ -230,22 +230,17 @@ error.
 
 **Matching** splits `Match` errors in `app.go`:
 
-- `ErrNoDriversAvailable`, and `context.DeadlineExceeded` when it is the
-  outer match deadline (`matchCtx.Err() != nil`), are business failures.
-  The handler logs and publishes a `ride.unmatched` event (reason
-  `no_drivers` or `match_deadline`, 300 ms publish budget), then returns
-  `nil` and the offset is committed. If that publish fails the error is
-  returned, so the runner retries and eventually dead-letters it like any
-  other infrastructure error. See
+- `ErrNoDriversAvailable` is a business outcome. The handler logs and publishes
+  a `ride.unmatched` event (reason `no_drivers`, 2 s publish budget), then
+  returns `nil` and the offset is committed. If that publish fails the error is
+  returned, so the runner retries and eventually dead-letters it like any other
+  infrastructure error. See
   [driver-state-model.md](driver-state-model.md#4b-the-unmatched-path).
-- Any other `Match` error is returned. That covers
-  Redis failures, any `DeadlineExceeded` that is not the outer match deadline,
-  and every `AssignDriver` failure (wrapped in `matching.ErrAssign`, such as
-  the detached assign timeout), which is retried even if the outer deadline
-  has expired by then. The runner retries and eventually dead-letters these. Retrying is safe because
-  `Match` replays an existing assignment instead of matching again
+- Any other `Match` error is returned, including a claim timeout. The runner
+  retries and eventually dead-letters these. Retrying is safe because the claim
+  replays an existing assignment instead of matching again
   (see [driver-state-model.md](driver-state-model.md)).
-- Publishing `ride.matched` has its own 300 ms budget; a publish failure is
+- Publishing `ride.matched` has its own 2 s budget; a publish failure is
   returned, retried and dead-lettered like any other infrastructure error.
 
 ---
@@ -289,7 +284,7 @@ error.
 | `pricing_retries_total`, `matching_retries_total` | Handler attempts that failed and were retried. |
 | `pricing_dlq_messages_total`, `matching_dlq_messages_total`, `assignment_dlq_messages_total` | Messages written to the service's DLQ topic. Should stay at zero in a healthy run. |
 | `match_idempotent_replays_total` | Matching saw a ride that already had a driver (retry or redelivery). Non-zero is evidence of redelivery being absorbed. |
-| `match_unmatched_published_total{reason}` | `ride.unmatched` events matching published, by `no_drivers` / `match_deadline`. |
+| `match_unmatched_published_total{reason}` | `ride.unmatched` events matching published, with reason `no_drivers`. |
 | `assignment_duplicates_total`, `unmatched_duplicates_total` | Redelivered `ride.matched` / `ride.unmatched` events assignment-service recognized and ignored. |
 | `pricing_events_consumed_total` | Handler **attempts**, retries included. Compare with `pricing_events_published_total`. |
 

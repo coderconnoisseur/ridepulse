@@ -47,30 +47,23 @@ The fare is ₹50 plus ₹12 per km. Distance is measured straight over the Eart
 
 ### Finding nearby drivers
 
-Drivers send their location to Redis every half second, and Redis can answer "who is near this point?" very quickly. The matching service asks for the 20 closest drivers within 50 km.
+Drivers send their location to Redis every half second, and Redis can answer "who is near this point?" very quickly. The search covers 50 km and starts from the closest driver.
 
 ### Not giving one driver to two riders
 
-This is the hardest problem in the project. Many rides can want the same driver at the same moment, so a driver is claimed in two stages:
+Many rides can want the same driver at the same moment. So finding a driver and assigning them happen as one step inside Redis: find the nearest free driver, mark them busy, link them to the ride, and remove them from search results.
 
-1. **Lock:** a short reservation that lasts 3 seconds. Only one ride can hold it, and Redis guarantees that even when requests arrive together. A driver who is already on a trip can't be locked.
-2. **Assign:** the lock turns into a real assignment. The driver is marked busy, the ride is linked to them, and they're removed from search results. All of this happens as one step, so it can't half-finish.
+Redis does these steps one at a time, so two rides can never pick the same driver, and nothing can half-finish.
 
-### Trying several drivers at once
-
-Trying drivers one at a time would be slow, so the matching service tries 5 at once and takes the first that succeeds. Any others it happened to lock are released straight away. Without that, they'd sit unusable for 3 seconds, which was a real bug in an earlier version (["phantom locks"](phantom-lock-fix.md)).
-
-### Spreading out riders in a busy area
-
-If everyone at a train station tried the same 5 closest drivers, most attempts would collide. So the 10 closest drivers are shuffled among themselves, then the next 10 among themselves. Riders spread out, but a far driver is never tried before a much closer group. See [the shuffle note](shuffle-nearest-first-fix.md).
+An earlier version reserved drivers with temporary locks. Under heavy load that became the bottleneck, so it was replaced. [This write-up](matching-under-load.md) explains how that was found.
 
 ### Time limits
 
-Each ride gets 500 ms to find a driver, and each group of 5 gets 200 ms of that. A slow ride can't hold up the system forever, and it gets a clear "no driver" result instead of hanging. See [the deadline note](deadline-fix.md).
+Each attempt to claim a driver gets 500 ms. If it runs out of time, the attempt is retried. That's safe because a retry for the same ride returns the same driver.
 
 ### Telling the system when no driver is found
 
-A ride that can't be matched isn't silently dropped. It's recorded as unmatched with a reason: `no_drivers` or `match_deadline`. Under heavy load, `no_drivers` can also mean the nearest 20 drivers were all reserved by other rides at that moment.
+A ride that can't be matched isn't silently dropped. It's recorded as unmatched with the reason `no_drivers`.
 
 ### Never losing a ride
 
@@ -132,9 +125,8 @@ curl http://localhost:2114/rides/<ride_id>
 **Not yet proven**
 
 - **No automated test with real Kafka and Redis.** The main flows were checked by hand on a live stack, but nothing repeats those checks automatically.
-- **Performance comes from one run on one machine.** All rides matched at up to 100 requests per second, and it peaked at about 134 matched rides per second. Past that, rides increasingly collide over the same drivers.
-- **It breaks down at very high load.** At a target of 800 requests per second, the gateway fell to about 45 and started returning errors. The cause hasn't been found.
-- **A small share of rides can get stuck under overload.** In the benchmark, 213 of about 42,000 rides ended up in a dead letter topic instead of getting a result.
+- **Performance comes from one run on one machine.** It accepted about 1,500 requests per second, and every ride got a result. Matched rides levelled off at about 160 per second because the 1,000 simulated drivers are busy for 5 seconds per trip.
+- **The true top speed isn't known.** Things slow down near 1,500 requests per second, but the services, Docker and the load generator all shared one machine, so that may be the machine's limit.
 
 **Not built yet**
 
@@ -154,6 +146,5 @@ curl http://localhost:2114/rides/<ride_id>
 - **Event:** a message saying something happened, such as "ride priced".
 - **Idempotent:** doing it twice has the same result as doing it once.
 - **Kafka topic:** a named queue of messages, such as `ride.requested`.
-- **Lock:** a temporary reservation only one ride can hold.
 - **p95 latency:** 95% of requests were this fast or faster.
 - **RPS:** requests per second.
