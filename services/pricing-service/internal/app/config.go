@@ -2,6 +2,8 @@ package app
 
 import (
 	"fmt"
+	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -9,17 +11,30 @@ import (
 type Config struct {
 	MetricsAddr  string
 	KafkaBrokers []string
+	Workers      int
 }
 
-// LoadConfig reads METRICS_ADDR and KAFKA_BROKERS via getenv.
+// LoadConfig reads METRICS_ADDR, KAFKA_BROKERS and PRICING_WORKERS via getenv.
 func LoadConfig(getenv func(string) string) (Config, error) {
 	brokers, err := parseBrokers(envOr(getenv, "KAFKA_BROKERS", "localhost:9092"))
 	if err != nil {
 		return Config{}, err
 	}
+
+	// Each worker blocks on a Kafka publish round trip, so the pool size caps
+	// throughput; pricing itself uses almost no CPU.
+	workers := runtime.NumCPU() * 25
+	if raw := strings.TrimSpace(getenv("PRICING_WORKERS")); raw != "" {
+		workers, err = strconv.Atoi(raw)
+		if err != nil || workers <= 0 {
+			return Config{}, fmt.Errorf("PRICING_WORKERS %q must be a positive integer", raw)
+		}
+	}
+
 	return Config{
 		MetricsAddr:  envOr(getenv, "METRICS_ADDR", ":2115"),
 		KafkaBrokers: brokers,
+		Workers:      workers,
 	}, nil
 }
 

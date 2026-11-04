@@ -53,6 +53,7 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.KafkaBrokers,
 		"pricing-service",
 		"ride.requested",
+		cfg.Workers,
 	)
 	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
