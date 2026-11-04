@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"ridepulse/services/assignment-service/internal/domain"
 	"ridepulse/services/assignment-service/internal/store"
 )
 
@@ -17,11 +18,13 @@ import (
 //
 //	GET /metrics                 — Prometheus scrape endpoint
 //	GET /assignments/<rideID>    — look up a single assignment (JSON)
-//	GET /count                   — total assignments stored (plaintext)
+//	GET /rides/<rideID>          — matched/unmatched outcome of a ride (JSON)
+//	GET /count                   — total matched assignments stored (plaintext)
 func NewServer(addr string, mem *store.Memory) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/assignments/", queryHandler(mem))
+	mux.HandleFunc("/rides/", rideHandler(mem))
 	mux.HandleFunc("/count", countHandler(mem))
 
 	return &http.Server{
@@ -46,6 +49,50 @@ func queryHandler(mem *store.Memory) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(a)
+	}
+}
+
+type matchedBody struct {
+	RideID    string `json:"ride_id"`
+	Status    string `json:"status"`
+	DriverID  string `json:"driver_id"`
+	MatchedAT int64  `json:"matched_at"`
+	LatencyMs int64  `json:"latency_ms"`
+}
+
+type unmatchedBody struct {
+	RideID   string `json:"ride_id"`
+	Status   string `json:"status"`
+	Reason   string `json:"reason"`
+	FailedAt int64  `json:"failed_at"`
+}
+
+func rideHandler(mem *store.Memory) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rideID := strings.TrimPrefix(r.URL.Path, "/rides/")
+		if rideID == "" {
+			http.Error(w, "missing ride id", http.StatusBadRequest)
+			return
+		}
+		o, ok := mem.Status(rideID)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		var body any
+		if o.Status == domain.StatusMatched {
+			body = matchedBody{
+				RideID:    o.RideID,
+				Status:    o.Status,
+				DriverID:  o.Assignment.DriverID,
+				MatchedAT: o.Assignment.MatchedAT,
+				LatencyMs: o.Assignment.LatencyMs,
+			}
+		} else {
+			body = unmatchedBody{RideID: o.RideID, Status: o.Status, Reason: o.Reason, FailedAt: o.FailedAt}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 

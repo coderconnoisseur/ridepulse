@@ -17,14 +17,13 @@ import (
 )
 
 const (
-	metricsAddr     = ":2115"
 	publishTimeout  = 300 * time.Millisecond
 	shutdownTimeout = 5 * time.Second
 )
 
 // Run serves metrics and consumes RideRequested events until ctx is
 // cancelled, then shuts everything down.
-func Run(ctx context.Context) error {
+func Run(ctx context.Context, cfg Config) error {
 	metrics.Register()
 
 	// Prometheus scrape endpoint on its own port. Uses a dedicated ServeMux so
@@ -32,24 +31,24 @@ func Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	server := &http.Server{
-		Addr:         metricsAddr,
+		Addr:         cfg.MetricsAddr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Printf("pricing-service metrics listening on %s", metricsAddr)
+		log.Printf("pricing-service metrics listening on %s", cfg.MetricsAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("pricing-service metrics server: %v", err)
 		}
 	}()
 
 	consumer := kafka.NewKafkaConsumer(
-		[]string{"localhost:9092"},
+		cfg.KafkaBrokers,
 		"pricing-service",
 		"ride.requested",
 	)
-	publisher := kafka.NewKafkaPublisher([]string{"localhost:9092"})
+	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
 	runErr := consumer.Run(ctx, func(ctx context.Context, event domain.RideRequestedEvent) error {
 		// Counts handler attempts (retries included); pricing_retries_total

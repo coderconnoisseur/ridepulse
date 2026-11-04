@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -317,6 +318,43 @@ func TestRunPermanentErrorSkipsRetries(t *testing.T) {
 			t.Fatalf("x-error = %q, want %q", h.Value, "bad payload")
 		}
 	}
+}
+
+func TestRunHandlerPanicGoesToDLQAndRunContinues(t *testing.T) {
+	r := newFakeReader(seq("t", 3)...)
+	dlq := &fakeWriter{}
+	var panics atomic.Int32
+	cancel, errc := startRun(r, Config{Workers: 1, MaxRetries: 3, RetryBackoff: time.Millisecond, DLQ: dlq, DLQTopic: "t.dlq"},
+		func(_ context.Context, m kafka.Message) error {
+			if m.Offset == 0 {
+				panics.Add(1)
+				panic("nil map write")
+			}
+			return nil
+		})
+
+	r.waitCommitted(t, 2)
+	cancel()
+	if err := waitRun(t, errc); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+	if got := panics.Load(); got != 1 {
+		t.Fatalf("panicking handler called %d times, want 1", got)
+	}
+	w := dlq.written()
+	if len(w) != 1 || string(w[0].Key) != "k0" {
+		t.Fatalf("DLQ = %d messages, want offset 0's message", len(w))
+	}
+	var xerr string
+	for _, h := range w[0].Headers {
+		if h.Key == "x-error" {
+			xerr = string(h.Value)
+		}
+	}
+	if !strings.Contains(xerr, "handler panic") {
+		t.Fatalf("x-error = %q, want it to contain %q", xerr, "handler panic")
+	}
+	assertMonotonic(t, r.committed())
 }
 
 func TestRunNilDLQDropsAndCommits(t *testing.T) {

@@ -15,9 +15,11 @@ type DriverRepository struct {
 	client *redis.Client
 }
 
-func NewDriverRepository(addr string) *DriverRepository {
+// NewDriverRepository connects to addr with a pool of poolSize connections.
+func NewDriverRepository(addr string, poolSize int) *DriverRepository {
 	rdb := redis.NewClient(&redis.Options{
-		Addr: addr,
+		Addr:     addr,
+		PoolSize: poolSize,
 	})
 	return &DriverRepository{client: rdb}
 }

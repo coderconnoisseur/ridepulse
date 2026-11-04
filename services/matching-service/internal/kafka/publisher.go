@@ -2,11 +2,13 @@ package kafka
 import(
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/segmentio/kafka-go"
 	"ridepulse/services/matching-service/internal/domain"
 )
 type KafkaPublisher struct{
 	writer *kafka.Writer;
+	unmatchedWriter *kafka.Writer
 }
 func NewKafkaPublisher (brokers[] string)*KafkaPublisher{
 	writer:=&kafka.Writer{
@@ -16,7 +18,15 @@ func NewKafkaPublisher (brokers[] string)*KafkaPublisher{
 		RequiredAcks: kafka.RequireOne,
 		BatchTimeout: 10_000_000,//10ms
 	}
-	return &KafkaPublisher{writer}
+	unmatched:=&kafka.Writer{
+		Addr: kafka.TCP(brokers...),
+		Topic:"ride.unmatched",
+		Balancer: &kafka.Hash{},
+		RequiredAcks: kafka.RequireOne,
+		BatchTimeout: 10_000_000,//10ms
+		AllowAutoTopicCreation: true,// new topic
+	}
+	return &KafkaPublisher{writer, unmatched}
 }
 
 func (p *KafkaPublisher) PublishRideMatched(
@@ -34,7 +44,22 @@ func (p *KafkaPublisher) PublishRideMatched(
 	return p.writer.WriteMessages(ctx, msg)
 }
 
-// Close flushes and closes the underlying writer.
+// PublishRideUnmatched writes a ride.unmatched event keyed by ride ID.
+func (p *KafkaPublisher) PublishRideUnmatched(
+	ctx context.Context,
+	event domain.RideUnmatchedEvent,
+)error{
+	val,err:=json.Marshal(event)
+	if err!=nil{
+		return err
+	}
+	return p.unmatchedWriter.WriteMessages(ctx, kafka.Message{
+		Key: []byte(event.RideID),
+		Value: val,
+	})
+}
+
+// Close flushes and closes both writers.
 func (p *KafkaPublisher) Close() error {
-	return p.writer.Close()
+	return errors.Join(p.writer.Close(), p.unmatchedWriter.Close())
 }

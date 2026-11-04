@@ -3,6 +3,7 @@ package matching
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -21,8 +22,11 @@ import (
 // outer deadline).
 const BatchDeadline = 200 * time.Millisecond
 
+// BatchSize is the number of drivers locked in parallel per batch. It is
+// exported so the Redis pool can be sized to workers * BatchSize.
+const BatchSize = 5
+
 const (
-	batchSize         = 5
 	batchDeadline     = BatchDeadline
 	releaseTimeout    = 200 * time.Millisecond
 	assignTimeout     = 200 * time.Millisecond
@@ -38,6 +42,11 @@ const (
 // ErrNoDriversAvailable means no free driver could be locked for the ride. It
 // is a business outcome, not an infrastructure failure, so it is not retried.
 var ErrNoDriversAvailable = errors.New("no drivers available")
+
+// ErrAssign wraps any AssignDriver failure other than ports.ErrLockLost. It is
+// an infrastructure error: callers retry it even if the match deadline has
+// expired (a retry replays via ride:driver).
+var ErrAssign = errors.New("assign driver")
 
 type Service struct {
 	repo ports.DriverRepository
@@ -127,7 +136,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 	// per tier instead of being pinned to a fixed 5.
 	shuffleWithinTiers(drivers, driverTierSize)
 
-	for i := 0; i < len(drivers); i += batchSize {
+	for i := 0; i < len(drivers); i += BatchSize {
 
 		select {
 		case <-ctx.Done():
@@ -136,7 +145,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		default:
 		}
 
-		end := i + batchSize
+		end := i + BatchSize
 		if end > len(drivers) {
 			end = len(drivers)
 		}
@@ -159,7 +168,7 @@ func (s *Service) Match(ctx context.Context, event domain.RidePricedEvent) (doma
 		if err != nil {
 			s.releaseLock(winnerID, event.RideID)
 			metrics.MatchFailures.Inc()
-			return domain.RideMatchedEvent{}, err
+			return domain.RideMatchedEvent{}, fmt.Errorf("%w: %w", ErrAssign, err)
 		}
 		metrics.MatchSuccess.Inc()
 		return matchedEvent(event, assignedID), nil

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"runtime"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -18,11 +17,12 @@ import (
 const dlqTopic = "ride.priced.dlq"
 
 type KafkaConsumer struct {
-	reader *kafka.Reader
-	dlq    *kafka.Writer
+	reader  *kafka.Reader
+	dlq     *kafka.Writer
+	workers int
 }
 
-func NewKafkaConsumer(brokers []string) *KafkaConsumer {
+func NewKafkaConsumer(brokers []string, workers int) *KafkaConsumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers,
 		GroupID: "matching-service",
@@ -46,7 +46,7 @@ func NewKafkaConsumer(brokers []string) *KafkaConsumer {
 		// Default batch timeout (1s) would stall every synchronous DLQ write.
 		BatchTimeout: 10 * time.Millisecond,
 	}
-	return &KafkaConsumer{reader: r, dlq: dlq}
+	return &KafkaConsumer{reader: r, dlq: dlq, workers: workers}
 }
 
 // Run consumes RidePriced events until ctx is cancelled, calling handler for
@@ -58,7 +58,7 @@ func (c *KafkaConsumer) Run(
 	handler func(ctx context.Context, event domain.RidePricedEvent) error,
 ) error {
 	cfg := kafkaconsumer.Config{
-		Workers:  runtime.NumCPU() * 5,
+		Workers:  c.workers,
 		DLQ:      c.dlq,
 		DLQTopic: dlqTopic,
 		OnRetry:  func(kafka.Message, int, error) { metrics.Retries.Inc() },

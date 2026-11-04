@@ -45,6 +45,17 @@ correctness during a benchmark:
 
 - `GET /assignments/<rideID>` — returns the stored assignment (JSON) or 404.
 - `GET /count` — plaintext count of assignments observed so far.
+- `GET /rides/<rideID>` — outcome of a ride, matched or unmatched (added
+  with the unmatched path, below), or 404.
+
+> **Update.** assignment-service now also consumes `ride.unmatched` (second
+> reader, own consumer group `assignment-service-unmatched`, so a not-yet-created
+> topic only delays that reader), records each ride's outcome once and ignores
+> duplicates. `assignments_total` and `end_to_end_latency_seconds` count each
+> matched ride once; redeliveries go to `assignment_duplicates_total`.
+> Unmatched rides are counted in `unmatched_total{reason}` and
+> `unmatched_end_to_end_latency_seconds`. See
+> [driver-state-model.md](driver-state-model.md#4b-the-unmatched-path).
 
 Layout:
 
@@ -271,6 +282,48 @@ RIDER_RPS=300 RIDER_CONCURRENCY=120 go run cmd/rider-simulator/main.go
 `RIDER_URL` (defaults `http://localhost:8080/rides`) is the third
 env-var handle.
 
+The rider simulator logs once a second:
+
+```
+RPS: <sent> | Errors: <n> | Dropped: <n> | Avg Latency(us): <n>
+```
+
+`Dropped` counts sends skipped because `RIDER_CONCURRENCY` requests were
+already in flight. The simulator never blocks its ticker on a slow gateway,
+so a non-zero `Dropped` means the offered load was below the requested
+`RIDER_RPS` and the step is measuring the concurrency cap rather than the
+pipeline. Raise `RIDER_CONCURRENCY` (or investigate gateway latency) until it
+stays at zero. `actual_rps_in` in the CSV is measured at the gateway and
+already reflects any shortfall.
+
+#### Environment variables (all services)
+
+Every service now reads its endpoints from the environment; unset or blank
+values use the defaults. Invalid values make the services exit at startup, except rider-simulator, which falls back to the default for a non-numeric or non-positive `RIDER_RPS` / `RIDER_CONCURRENCY`; double-check these when running the ladder.
+
+| Variable | Default | Used by | Meaning |
+|---|---|---|---|
+| `KAFKA_BROKERS` | `localhost:9092` | api-gateway, pricing, matching, assignment | Comma-separated broker list. |
+| `REDIS_ADDR` | `localhost:6379` | matching, driver-simulator | Redis address. |
+| `HTTP_ADDR` | `:8080` (api-gateway), `:2114` (assignment) | api-gateway, assignment | HTTP listen address (also serves `/metrics`). |
+| `METRICS_ADDR` | `:2115` (pricing), `:2112` (matching) | pricing, matching | Metrics listen address. |
+| `MATCH_WORKERS` | `runtime.NumCPU() * 25` | matching | Matcher worker-pool size; positive integer. |
+| `REDIS_POOL_SIZE` | `MATCH_WORKERS * 5` | matching | Redis connection pool size; positive integer. Each worker runs up to 5 parallel `SETNX` attempts, while the go-redis default is only 10 x GOMAXPROCS. |
+| `MATCH_DEADLINE` | `500ms` | matching | Total per-match budget (Go duration); must exceed the 200 ms batch deadline. |
+| `RIDER_URL` | `http://localhost:8080/rides` | rider-simulator | Gateway endpoint. |
+| `RIDER_RPS` | `500` | rider-simulator | Target requests per second. |
+| `RIDER_CONCURRENCY` | `200` | rider-simulator | Max in-flight requests. |
+| `DRIVER_COUNT` | `1000` | driver-simulator | Number of simulated drivers. |
+| `DRIVER_TRIP_DURATION` | `5s` | driver-simulator | How long an assigned driver stays busy. |
+
+**The ladder must be re-run.** Besides the driver-supply change below, the
+matcher defaults moved from `NumCPU * 5` workers and an 800 ms deadline to
+`NumCPU * 25` and 500 ms, and the rider simulator now paces with a batched
+ticker. None of these values has been measured: they are a starting point.
+Record `MATCH_WORKERS`, `MATCH_DEADLINE`, `DRIVER_COUNT` and
+`DRIVER_TRIP_DURATION` with every result set, and vary one at a time. The
+committed CSV predates all of it.
+
 #### Driver supply and DLQ topics (added with the correctness work)
 
 Drivers are no longer instantly reusable: a matched driver is removed from
@@ -289,7 +342,8 @@ record them with the results. `tools/benchmark/benchmark-results.csv`
 predates this change and is not comparable; re-run the ladder.
 
 Each consumer dead-letters failures to `<topic>.dlq` (`ride.requested.dlq`,
-`ride.priced.dlq`, `ride.matched.dlq`), auto-created on first write. A
+`ride.priced.dlq`, `ride.matched.dlq`, `ride.unmatched.dlq`), auto-created on
+first write; a handler panic is dead-lettered too. A
 healthy run leaves them empty; check `pricing_dlq_messages_total`,
 `matching_dlq_messages_total` and `assignment_dlq_messages_total` after each
 step. See [at-least-once-consumers.md](at-least-once-consumers.md) and
@@ -303,6 +357,9 @@ curl -s http://localhost:2114/count
 
 # Fetch a specific ride's assignment
 curl -s http://localhost:2114/assignments/<rideID> | jq
+
+# Outcome of any ride: status "matched" or "unmatched" (with reason)
+curl -s http://localhost:2114/rides/<rideID> | jq
 ```
 
 If `/count` is much lower than the number of `POST /rides` you sent,
@@ -360,9 +417,25 @@ rate(driver_lock_released_phantom_total[1m])
 - Rising `driver_lock_released_phantom_total` → phantom-lock guard is
   actively doing work. Good sign, expected under contention.
 - Rising `matching_failures_total` with high `driver_lock_conflict_total`
-  → the outer match deadline (800 ms) isn't enough to traverse all four
-  batches for these rides. Consider larger radius or fewer batches
-  before failing.
+  → the outer match deadline (`MATCH_DEADLINE`, default 500 ms) isn't
+  enough to traverse all the batches for these rides. Consider larger radius
+  or fewer batches before failing.
+
+Failures are now visible downstream as well: matching publishes
+`ride.unmatched` and assignment-service counts it.
+
+```
+sum by (reason) (rate(match_unmatched_published_total[1m]))
+sum by (reason) (rate(unmatched_total[1m]))
+histogram_quantile(0.95, sum by (le) (rate(unmatched_end_to_end_latency_seconds_bucket[1m])))
+```
+
+`reason="no_drivers"` is supply exhaustion (check `DRIVER_COUNT` against
+`DRIVER_TRIP_DURATION`); `reason="match_deadline"` is the match budget running
+out. The two counters should track each other; a gap means unmatched events
+are in flight or in `ride.unmatched.dlq`. Note that `success_rate_pct` in the
+CSV is `assignments_rps / actual_rps_in`, so unmatched rides count as
+failures there.
 
 ### 4e. Retries, dead letters and replays
 
@@ -373,11 +446,15 @@ increase(pricing_dlq_messages_total[5m])
 increase(matching_dlq_messages_total[5m])
 increase(assignment_dlq_messages_total[5m])
 rate(match_idempotent_replays_total[1m])
+rate(assignment_duplicates_total[1m])
+rate(unmatched_duplicates_total[1m])
 ```
 
 Any DLQ increase invalidates the step's success rate; inspect the `x-error`
 header on the DLQ record. `match_idempotent_replays_total` above zero means
 a retry or redelivery was absorbed without assigning a second driver.
+`assignment_duplicates_total` and `unmatched_duplicates_total` above zero mean
+assignment-service absorbed a redelivery without double-counting.
 
 ### 4f. Publish-error attribution
 
@@ -421,10 +498,11 @@ You will very likely hit one of these first:
    at 1000 drivers × 500 ms tick. Under matcher load, GEORADIUS queries
    compete with those writes on a single Redis connection. Fix:
    pipeline the GEOADDs and/or use a Redis pool.
-3. **Windows ticker granularity in rider-simulator** — `time.Second /
-   1000 = 1 ms` ticker won't fire that fast on Windows (~15 ms
-   resolution). At requested-RPS > ~600 you'll see actual RPS plateau
-   even though the code says otherwise.
+3. **Rider-simulator concurrency cap** — the simulator ticks every 20 ms
+   (above Windows' ~15 ms timer resolution) and sends a batch sized to the
+   target rate, so the old plateau from a 1 ms ticker is gone. If
+   `RIDER_CONCURRENCY` is too low for the gateway's latency, sends are
+   skipped instead; watch the `Dropped` counter in its log.
 
 Whichever of these shows up first is your real first bottleneck.
 Everything downstream that "seemed" slow was masked by it.
@@ -485,14 +563,20 @@ of scope for the "can we measure at all?" pass:
   explicitly create topics with `partitions=8` (or so) in a bootstrap
   step in `docker-compose.yml`, and run multiple matching-service /
   pricing-service instances.
-- **Env-var config**. Most hosts are still hardcoded (`localhost:9092`,
-  `localhost:6379`, etc.; driver-simulator now reads `REDIS_ADDR`). Fine for a single-host benchmark; blocks
-  running any service on a different box.
+- ~~Env-var config~~ is done: every service reads `KAFKA_BROKERS`,
+  `REDIS_ADDR`, `HTTP_ADDR` / `METRICS_ADDR` and, for matching,
+  `MATCH_WORKERS` / `MATCH_DEADLINE` (table in section 3c).
+- **Fail-fast on batch 1.** A fully contended first batch still waits out the
+  match deadline and holds a worker.
+- **Re-run the ladder** with the new matcher defaults before trusting any
+  number.
 - ~~Graceful shutdown~~, ~~silent-drop consumer retries~~ and
   ~~match-failed vs publish-failed~~ are addressed by the shared consumer
   runner; see [at-least-once-consumers.md](at-least-once-consumers.md).
-  Still open: `ride.unmatched` for rides with no driver, dedupe in
-  assignment-service, and rebalance-safe offset tracking.
+  `ride.unmatched` for rides with no driver, dedupe in assignment-service
+  and epoch-stamped offset tracking have since been added. Still open:
+  detection of a re-assignment above the last tracked offset, and a
+  persistent assignment store.
 - **Grafana dashboards**. Prometheus's own UI is fine for reading
   metrics, but a permanent dashboard would make comparing benchmark
   runs faster.

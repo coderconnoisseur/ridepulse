@@ -84,6 +84,14 @@ var (
 		},
 	)
 
+	MatchUnmatchedPublished = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "match_unmatched_published_total",
+			Help: "ride.unmatched events published, by reason.",
+		},
+		[]string{"reason"},
+	)
+
 	MatchLatency = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "matching_latency_seconds",
@@ -131,6 +139,7 @@ func Register() {
 		MatchSuccess,
 		MatchFailures,
 		MatchIdempotentReplays,
+		MatchUnmatchedPublished,
 		MatchLatency,
 		NearbyDrivers,
 		Goroutines,
