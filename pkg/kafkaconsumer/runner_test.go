@@ -3,6 +3,7 @@ package kafkaconsumer
 import (
 	"context"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -474,5 +475,57 @@ func TestPermanentIsDetectableThroughWrapping(t *testing.T) {
 	}
 	if IsPermanent(base) || IsPermanent(nil) || Permanent(nil) != nil {
 		t.Fatal("non-permanent errors misclassified")
+	}
+}
+
+// flakyReader returns each queued fetch error once, then behaves as fakeReader.
+type flakyReader struct {
+	*fakeReader
+	mu   sync.Mutex
+	errs []error
+}
+
+func (f *flakyReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	f.mu.Lock()
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		f.mu.Unlock()
+		return kafka.Message{}, err
+	}
+	f.mu.Unlock()
+	return f.fakeReader.FetchMessage(ctx)
+}
+
+func TestRunTransientFetchErrorIsRetriedNotFatal(t *testing.T) {
+	transient := errors.New("[5] Leader Not Available")
+	r := &flakyReader{fakeReader: newFakeReader(seq("t", 1)...), errs: []error{transient, transient}}
+
+	cancel, errc := startRun(r, Config{Workers: 1}, func(context.Context, kafka.Message) error { return nil })
+	r.waitCommitted(t, 0)
+	cancel()
+	if err := waitRun(t, errc); err != nil {
+		t.Fatalf("Run returned %v, want nil after transient fetch errors", err)
+	}
+}
+
+func TestRunClosedReaderIsFatal(t *testing.T) {
+	r := &flakyReader{fakeReader: newFakeReader(), errs: []error{io.EOF}}
+
+	cancel, errc := startRun(r, Config{Workers: 1}, func(context.Context, kafka.Message) error { return nil })
+	defer cancel()
+	if err := waitRun(t, errc); !errors.Is(err, io.EOF) {
+		t.Fatalf("Run returned %v, want io.EOF", err)
+	}
+}
+
+func TestRunCancelDuringFetchBackoffReturnsCleanly(t *testing.T) {
+	r := &flakyReader{fakeReader: newFakeReader(), errs: []error{errors.New("broker down")}}
+
+	cancel, errc := startRun(r, Config{Workers: 1}, func(context.Context, kafka.Message) error { return nil })
+	time.Sleep(10 * time.Millisecond) // let the fetch loop enter its backoff
+	cancel()
+	if err := waitRun(t, errc); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
 	}
 }

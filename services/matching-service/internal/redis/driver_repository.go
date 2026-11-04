@@ -2,13 +2,11 @@ package redis
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"ridepulse/services/matching-service/internal/metrics"
-	"ridepulse/services/matching-service/internal/ports"
 )
 
 type DriverRepository struct {
@@ -16,180 +14,97 @@ type DriverRepository struct {
 }
 
 // NewDriverRepository connects to addr with a pool of poolSize connections.
+// Commands honour context deadlines, so a claim can't outlive its timeout.
 func NewDriverRepository(addr string, poolSize int) *DriverRepository {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		PoolSize: poolSize,
+		Addr:                  addr,
+		PoolSize:              poolSize,
+		ContextTimeoutEnabled: true,
 	})
 	return &DriverRepository{client: rdb}
 }
 
 // Redis keys shared with driver-simulator. Do not rename.
 const (
-	locationsKey = "drivers:locations"
+	locationsKey      = "drivers:locations"
+	assignedKeyPrefix = "driver:assigned:" // <driverID>, value = rideID (safety net TTL)
 
-	lockTTL       = 3 * time.Second  // driver:lock:<driverID>, value = rideID
-	assignedTTL   = 10 * time.Minute // driver:assigned:<driverID>, value = rideID (safety net)
-	rideDriverTTL = time.Hour        // ride:driver:<rideID>, value = driverID (idempotency record)
+	assignedTTL   = 10 * time.Minute
+	rideDriverTTL = time.Hour // ride:driver:<rideID>, value = driverID (idempotency record)
+
+	// candidateCount is how many nearest drivers one claim examines. Assigned
+	// drivers leave the GEO set, so the first candidate is nearly always free.
+	candidateCount = 20
 )
 
-func lockKey(driverID string) string     { return fmt.Sprintf("driver:lock:%s", driverID) }
-func assignedKey(driverID string) string { return fmt.Sprintf("driver:assigned:%s", driverID) }
-func rideDriverKey(rideID string) string { return fmt.Sprintf("ride:driver:%s", rideID) }
+func rideDriverKey(rideID string) string { return "ride:driver:" + rideID }
 
-// tryLockScript refuses assigned drivers, otherwise SET NX PX the lock.
-// KEYS: assigned, lock. ARGV: rideID, lock TTL ms. Returns 1 if locked.
-var tryLockScript = redis.NewScript(`
-if redis.call("EXISTS", KEYS[1]) == 1 then
-	return 0
-end
-if redis.call("SET", KEYS[2], ARGV[1], "NX", "PX", ARGV[2]) then
-	return 1
-end
-return 0
-`)
-
-// assignScript atomically turns our lock into an assignment.
-// KEYS: lock, ride:driver, assigned, drivers:locations.
-// ARGV: rideID, driverID, assigned TTL s, ride:driver TTL s.
-// Returns the assigned driverID, or false (nil reply) if we no longer hold
-// the lock. If the ride already has a driver (retry/redelivery), our lock is
-// dropped and the existing driver is returned untouched.
-var assignScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) ~= ARGV[1] then
-	return false
-end
-local existing = redis.call("GET", KEYS[2])
+// claimScript assigns the nearest free driver as one atomic step, so concurrent
+// rides can never collide over a driver and need no locks.
+//
+// It builds driver:assigned keys at runtime, so it needs a single Redis
+// instance, not Redis Cluster.
+//
+// KEYS: ride:driver, drivers:locations.
+// ARGV: rideID, lng, lat, radius km, candidate count, assigned TTL s,
+// ride:driver TTL s, assigned key prefix.
+// Returns {driverID, replayed}, or false if no free driver is in range.
+var claimScript = redis.NewScript(`
+local existing = redis.call("GET", KEYS[1])
 if existing then
-	redis.call("DEL", KEYS[1])
-	return existing
+	return {existing, 1}
 end
-redis.call("SET", KEYS[3], ARGV[1], "EX", ARGV[3])
-redis.call("SET", KEYS[2], ARGV[2], "EX", ARGV[4])
-redis.call("ZREM", KEYS[4], ARGV[2])
-redis.call("DEL", KEYS[1])
-return ARGV[2]
+local candidates = redis.call("GEORADIUS_RO", KEYS[2], ARGV[2], ARGV[3], ARGV[4], "km", "COUNT", ARGV[5], "ASC")
+for _, driver in ipairs(candidates) do
+	local assigned = ARGV[8] .. driver
+	if redis.call("EXISTS", assigned) == 0 then
+		redis.call("SET", assigned, ARGV[1], "EX", ARGV[6])
+		redis.call("SET", KEYS[1], driver, "EX", ARGV[7])
+		redis.call("ZREM", KEYS[2], driver)
+		return {driver, 0}
+	end
+end
+return false
 `)
 
-// unlockScript releases a driver lock only if its current value matches the
-// caller's rideID. Prevents deleting a lock that has already expired and been
-// reacquired by a different ride between our GET and DEL.
-var unlockScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-	return redis.call("DEL", KEYS[1])
-else
-	return 0
-end
-`)
-
-func (r *DriverRepository) FindNearbyDrivers(
+// ClaimNearestDriver implements ports.DriverRepository.
+func (r *DriverRepository) ClaimNearestDriver(
 	ctx context.Context,
-	lat, lng float64,
-	radiusKm float64,
-) ([]string, error) {
+	rideID string,
+	lat, lng, radiusKM float64,
+) (string, bool, error) {
 	start := time.Now()
-	res, err := r.client.GeoRadius(
+	res, err := claimScript.Run(
 		ctx,
-		locationsKey,
+		r.client,
+		[]string{rideDriverKey(rideID), locationsKey},
+		rideID,
 		lng,
 		lat,
-		&redis.GeoRadiusQuery{
-			Radius: radiusKm,
-			Unit:   "km",
-			Count:  20,
-			Sort:   "ASC",
-		}).Result()
-	metrics.RedisGeoLatency.Observe(time.Since(start).Seconds())
-	if err != nil {
-		return nil, err
-	}
-	var drivers []string
-	for _, r := range res {
-		drivers = append(drivers, r.Name)
-	}
-	metrics.NearbyDriversGauge.Set(float64(len(drivers)))
-	return drivers, nil
-}
-
-// TryLockDriver takes the short-lived matching lock on a driver, refusing
-// drivers that are already assigned to a ride.
-func (r *DriverRepository) TryLockDriver(
-	ctx context.Context,
-	driverID,
-	rideID string,
-) (bool, error) {
-	start := time.Now()
-	res, err := tryLockScript.Run(
-		ctx,
-		r.client,
-		[]string{assignedKey(driverID), lockKey(driverID)},
-		rideID,
-		lockTTL.Milliseconds(),
-	).Int()
-	metrics.DriverLockLatency.Observe(time.Since(start).Seconds())
-	if err != nil {
-		return false, err
-	}
-	ok := res == 1
-	if ok {
-		metrics.DriverLockSuccess.Inc()
-	} else {
-		metrics.DriverLockConflict.Inc()
-	}
-	return ok, nil
-}
-
-// UnlockDriver releases a lock we own. Used to reclaim "phantom" locks:
-// SETNX operations that succeeded but lost the batch race to another driver.
-// The Lua script guarantees we never delete a lock that some other ride has
-// since acquired (after TTL expiry or lock churn).
-func (r *DriverRepository) UnlockDriver(
-	ctx context.Context,
-	driverID, rideID string,
-) error {
-	_, err := unlockScript.Run(ctx, r.client, []string{lockKey(driverID)}, rideID).Result()
-	if err == redis.Nil {
-		return nil
-	}
-	return err
-}
-
-// Close closes the underlying Redis client.
-func (r *DriverRepository) Close() error {
-	return r.client.Close()
-}
-
-// AssignDriver marks driverID as assigned to rideID, records the ride's
-// driver for idempotent replay, removes the driver from the GEO set and
-// releases the matching lock — all in one atomic script. Returns
-// ports.ErrLockLost if our lock expired or was taken by another ride.
-func (r *DriverRepository) AssignDriver(ctx context.Context, driverID, rideID string) (string, error) {
-	assigned, err := assignScript.Run(
-		ctx,
-		r.client,
-		[]string{lockKey(driverID), rideDriverKey(rideID), assignedKey(driverID), locationsKey},
-		rideID,
-		driverID,
+		radiusKM,
+		candidateCount,
 		int64(assignedTTL.Seconds()),
 		int64(rideDriverTTL.Seconds()),
-	).Text()
-	if err == redis.Nil {
-		return "", ports.ErrLockLost
-	}
-	if err != nil {
-		return "", err
-	}
-	return assigned, nil
-}
-
-// GetRideDriver returns the driver already assigned to rideID, if any.
-func (r *DriverRepository) GetRideDriver(ctx context.Context, rideID string) (string, bool, error) {
-	driverID, err := r.client.Get(ctx, rideDriverKey(rideID)).Result()
+		assignedKeyPrefix,
+	).Slice()
+	metrics.DriverClaimLatency.Observe(time.Since(start).Seconds())
 	if err == redis.Nil {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, err
 	}
-	return driverID, true, nil
+	driverID, _ := res[0].(string)
+	replayed, _ := res[1].(int64)
+	return driverID, replayed == 1, nil
+}
+
+// Ping checks that Redis answers; used by the /ready probe.
+func (r *DriverRepository) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
+}
+
+// Close closes the underlying Redis client.
+func (r *DriverRepository) Close() error {
+	return r.client.Close()
 }

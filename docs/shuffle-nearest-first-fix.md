@@ -1,5 +1,7 @@
 # Shuffle vs Nearest-First Fix — Matching Service
 
+> **Superseded.** The live benchmark showed this locking design was itself the bottleneck, and it has been replaced by an atomic driver claim. See [matching-under-load.md](matching-under-load.md). This note is kept as a record of the earlier work; its code no longer exists.
+
 > **Status:** local-only note. Not intended for the public repo.
 > Documents the shuffle-vs-nearest-first policy conflict in the matching
 > loop, why the author's own "random offset + circular iteration" idea
