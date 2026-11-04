@@ -4,8 +4,8 @@
 // error rather than as silently empty values on the wire.
 //
 // Wire format: snake_case JSON keys and a leading "v" version field. Bump
-// Version only for incompatible changes; consumers that cannot handle a
-// version must dead-letter the message instead of guessing.
+// Version only for incompatible changes. Consumers don't check it yet, so a
+// version bump also needs those checks added.
 package events
 
 // Version is the contract version written into every event produced by this
@@ -54,12 +54,17 @@ type RidePricedEvent struct {
 }
 
 // RideMatchedEvent is published by matching-service when a driver is assigned.
+// MatchedAt is the Unix time, in seconds, when the driver was claimed. A replay
+// after a crash keeps that original time. The fare is copied from ride.priced.
 type RideMatchedEvent struct {
-	Version     int    `json:"v"`
-	RideID      string `json:"ride_id"`
-	DriverID    string `json:"driver_id"`
-	MatchedAt   int64  `json:"matched_at"`
-	RequestedAt int64  `json:"requested_at"`
+	Version         int     `json:"v"`
+	RideID          string  `json:"ride_id"`
+	DriverID        string  `json:"driver_id"`
+	MatchedAt       int64   `json:"matched_at"`
+	RequestedAt     int64   `json:"requested_at"`
+	Price           float64 `json:"price"`
+	Currency        string  `json:"currency"`
+	SurgeMultiplier float64 `json:"surge_multiplier"`
 }
 
 // RideUnmatchedEvent is published by matching-service when no driver could be

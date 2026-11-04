@@ -6,6 +6,10 @@ type Assignment struct {
 	DriverID  string `json:"driver_id"`
 	MatchedAT int64  `json:"matched_at"`
 	LatencyMs int64  `json:"latency_ms"`
+
+	Price           float64 `json:"price"`
+	Currency        string  `json:"currency"`
+	SurgeMultiplier float64 `json:"surge_multiplier"`
 }
 
 // Ride outcome statuses reported by the store and the HTTP API.

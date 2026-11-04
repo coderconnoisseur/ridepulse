@@ -53,7 +53,7 @@ func TestRidePricedRoundTrip(t *testing.T) {
 func TestRideMatchedRoundTrip(t *testing.T) {
 	roundTrip(t, RideMatchedEvent{
 		Version: Version, RideID: "r1", DriverID: "d1", MatchedAt: 7, RequestedAt: 42,
-	}, []string{"v", "ride_id", "driver_id", "matched_at", "requested_at"})
+	}, []string{"v", "ride_id", "driver_id", "matched_at", "requested_at", "price", "currency", "surge_multiplier"})
 }
 
 func TestRideUnmatchedRoundTrip(t *testing.T) {

@@ -67,6 +67,10 @@ type matchedBody struct {
 	DriverID  string `json:"driver_id"`
 	MatchedAT int64  `json:"matched_at"`
 	LatencyMs int64  `json:"latency_ms"`
+
+	Price           float64 `json:"price"`
+	Currency        string  `json:"currency"`
+	SurgeMultiplier float64 `json:"surge_multiplier"`
 }
 
 type unmatchedBody struct {
@@ -96,6 +100,10 @@ func rideHandler(mem *store.Memory) http.HandlerFunc {
 				DriverID:  o.Assignment.DriverID,
 				MatchedAT: o.Assignment.MatchedAT,
 				LatencyMs: o.Assignment.LatencyMs,
+
+				Price:           o.Assignment.Price,
+				Currency:        o.Assignment.Currency,
+				SurgeMultiplier: o.Assignment.SurgeMultiplier,
 			}
 		} else {
 			body = unmatchedBody{RideID: o.RideID, Status: o.Status, Reason: o.Reason, FailedAt: o.FailedAt}

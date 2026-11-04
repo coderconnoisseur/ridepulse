@@ -90,6 +90,10 @@ func handleMatched(mem *store.Memory) func(context.Context, events.RideMatchedEv
 			DriverID:  event.DriverID,
 			MatchedAT: event.MatchedAt,
 			LatencyMs: latencyMs,
+
+			Price:           event.Price,
+			Currency:        event.Currency,
+			SurgeMultiplier: event.SurgeMultiplier,
 		})
 		if !isNew {
 			metrics.AssignmentDuplicates.Inc()

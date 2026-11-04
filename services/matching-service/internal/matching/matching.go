@@ -41,25 +41,28 @@ func (s *Service) Match(ctx context.Context, event events.RidePricedEvent) (even
 	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.timeout)
 	defer cancel()
 
-	driverID, replayed, err := s.repo.ClaimNearestDriver(claimCtx, event.RideID, event.Pickup.Lat, event.Pickup.Lng, searchRadiusKM)
+	claim, err := s.repo.ClaimNearestDriver(claimCtx, event.RideID, event.Pickup.Lat, event.Pickup.Lng, searchRadiusKM)
 	if err != nil {
 		metrics.MatchFailures.Inc()
 		return events.RideMatchedEvent{}, err
 	}
-	if driverID == "" {
+	if claim.DriverID == "" {
 		metrics.MatchFailures.Inc()
 		return events.RideMatchedEvent{}, ErrNoDriversAvailable
 	}
-	if replayed {
+	if claim.Replayed {
 		metrics.MatchIdempotentReplays.Inc()
 	} else {
 		metrics.MatchSuccess.Inc()
 	}
 	return events.RideMatchedEvent{
-		Version:     events.Version,
-		RideID:      event.RideID,
-		DriverID:    driverID,
-		MatchedAt:   time.Now().Unix(),
-		RequestedAt: event.RequestedAt,
+		Version:         events.Version,
+		RideID:          event.RideID,
+		DriverID:        claim.DriverID,
+		MatchedAt:       claim.ClaimedAt,
+		RequestedAt:     event.RequestedAt,
+		Price:           event.Price,
+		Currency:        event.Currency,
+		SurgeMultiplier: event.SurgeMultiplier,
 	}, nil
 }

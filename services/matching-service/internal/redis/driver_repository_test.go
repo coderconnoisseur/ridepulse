@@ -39,11 +39,11 @@ func addDriver(t *testing.T, repo *DriverRepository, id string, offsetDeg float6
 
 func claim(t *testing.T, repo *DriverRepository, rideID string) (string, bool) {
 	t.Helper()
-	id, replayed, err := repo.ClaimNearestDriver(context.Background(), rideID, pickupLat, pickupLng, radiusKM)
+	c, err := repo.ClaimNearestDriver(context.Background(), rideID, pickupLat, pickupLng, radiusKM)
 	if err != nil {
 		t.Fatalf("ClaimNearestDriver(%s): %v", rideID, err)
 	}
-	return id, replayed
+	return c.DriverID, c.Replayed
 }
 
 func TestClaimPicksNearestAndRecordsAssignment(t *testing.T) {
@@ -61,11 +61,11 @@ func TestClaimPicksNearestAndRecordsAssignment(t *testing.T) {
 	if ttl := mr.TTL("driver:assigned:near"); ttl != 10*time.Minute {
 		t.Fatalf("driver:assigned ttl = %v, want 10m", ttl)
 	}
-	if v, _ := mr.Get("ride:driver:ride-1"); v != "near" {
-		t.Fatalf("ride:driver:ride-1 = %q, want near", v)
+	if v := mr.HGet("ride:outcome:ride-1", "driver"); v != "near" {
+		t.Fatalf("outcome driver = %q, want near", v)
 	}
-	if ttl := mr.TTL("ride:driver:ride-1"); ttl != time.Hour {
-		t.Fatalf("ride:driver ttl = %v, want 1h", ttl)
+	if ttl := mr.TTL("ride:outcome:ride-1"); ttl != time.Hour {
+		t.Fatalf("outcome ttl = %v, want 1h", ttl)
 	}
 	members, err := mr.ZMembers(locationsKey)
 	if err != nil {
@@ -115,8 +115,54 @@ func TestClaimNoDriverInRange(t *testing.T) {
 	if id != "" || replayed {
 		t.Fatalf("claim = (%q, %v), want no driver", id, replayed)
 	}
-	if mr.Exists("ride:driver:ride-1") {
-		t.Fatal("ride recorded without a driver")
+	if v := mr.HGet("ride:outcome:ride-1", "driver"); v != "" {
+		t.Fatalf("outcome driver = %q, want none", v)
+	}
+	if ttl := mr.TTL("ride:outcome:ride-1"); ttl != 10*time.Minute {
+		t.Fatalf("unmatched outcome ttl = %v, want 10m", ttl)
+	}
+}
+
+func TestClaimUnmatchedOutcomeIsFinal(t *testing.T) {
+	repo, mr := newTestRepo(t)
+
+	if id, _ := claim(t, repo, "ride-1"); id != "" {
+		t.Fatalf("claimed %q from an empty set", id)
+	}
+	// A driver becomes free before the redelivery arrives.
+	addDriver(t, repo, "late", 0.01)
+
+	if id, _ := claim(t, repo, "ride-1"); id != "" {
+		t.Fatalf("redelivered ride got %q after being reported unmatched", id)
+	}
+	if mr.Exists("driver:assigned:late") {
+		t.Fatal("driver taken for a ride already reported unmatched")
+	}
+	if id, _ := claim(t, repo, "ride-2"); id != "late" {
+		t.Fatalf("a new ride got %q, want late", id)
+	}
+}
+
+func TestClaimRecordsAndReplaysClaimTime(t *testing.T) {
+	repo, mr := newTestRepo(t)
+	addDriver(t, repo, "d1", 0.01)
+
+	before := time.Now().Unix()
+	first, err := repo.ClaimNearestDriver(context.Background(), "ride-1", pickupLat, pickupLng, radiusKM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ClaimedAt < before || first.ClaimedAt > time.Now().Unix() {
+		t.Fatalf("ClaimedAt = %d, want about now (%d)", first.ClaimedAt, before)
+	}
+
+	mr.HSet("ride:outcome:ride-1", "claimed_at", "1000") // as if claimed long ago
+	again, err := repo.ClaimNearestDriver(context.Background(), "ride-1", pickupLat, pickupLng, radiusKM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Replayed || again.ClaimedAt != 1000 {
+		t.Fatalf("replay = %+v, want Replayed with ClaimedAt 1000", again)
 	}
 }
 
@@ -143,11 +189,12 @@ func TestConcurrentClaimsNeverShareADriver(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			rideID := fmt.Sprintf("ride-%d", i)
-			id, _, err := repo.ClaimNearestDriver(context.Background(), rideID, pickupLat, pickupLng, radiusKM)
+			c, err := repo.ClaimNearestDriver(context.Background(), rideID, pickupLat, pickupLng, radiusKM)
 			if err != nil {
 				t.Errorf("claim %s: %v", rideID, err)
 				return
 			}
+			id := c.DriverID
 			if id == "" {
 				return
 			}
@@ -187,7 +234,7 @@ func TestClaimHonoursContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, _, err = repo.ClaimNearestDriver(ctx, "ride-1", pickupLat, pickupLng, radiusKM)
+	_, err = repo.ClaimNearestDriver(ctx, "ride-1", pickupLat, pickupLng, radiusKM)
 	if err == nil {
 		t.Fatal("want an error from a server that never replies")
 	}

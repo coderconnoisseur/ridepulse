@@ -19,7 +19,7 @@ func get(mem *store.Memory, path string) *httptest.ResponseRecorder {
 
 func TestRideStatusShapes(t *testing.T) {
 	mem := store.NewMemory()
-	mem.PutMatched(domain.Assignment{RideID: "m1", DriverID: "d1", MatchedAT: 100, LatencyMs: 42})
+	mem.PutMatched(domain.Assignment{RideID: "m1", DriverID: "d1", MatchedAT: 100, LatencyMs: 42, Price: 134.18, Currency: "INR", SurgeMultiplier: 1.5})
 	mem.PutUnmatched("u1", "no_drivers", 200)
 
 	cases := []struct {
@@ -28,6 +28,7 @@ func TestRideStatusShapes(t *testing.T) {
 	}{
 		{"/rides/m1", map[string]any{
 			"ride_id": "m1", "status": "matched", "driver_id": "d1", "matched_at": 100.0, "latency_ms": 42.0,
+			"price": 134.18, "currency": "INR", "surge_multiplier": 1.5,
 		}},
 		{"/rides/u1", map[string]any{
 			"ride_id": "u1", "status": "unmatched", "reason": "no_drivers", "failed_at": 200.0,

@@ -7,40 +7,46 @@ import (
 	"time"
 
 	"ridepulse/pkg/events"
+	"ridepulse/services/matching-service/internal/ports"
 )
 
 type fakeRepo struct {
-	driverID string
-	replayed bool
-	err      error
-	check    func(ctx context.Context)
+	claim ports.Claim
+	err   error
+	check func(ctx context.Context)
 }
 
-func (f *fakeRepo) ClaimNearestDriver(ctx context.Context, _ string, _, _, _ float64) (string, bool, error) {
+func (f *fakeRepo) ClaimNearestDriver(ctx context.Context, _ string, _, _, _ float64) (ports.Claim, error) {
 	if f.check != nil {
 		f.check(ctx)
 	}
-	return f.driverID, f.replayed, f.err
+	return f.claim, f.err
 }
 
-func TestMatchReturnsClaimedDriver(t *testing.T) {
-	svc := New(&fakeRepo{driverID: "driver-7"}, time.Second)
+func TestMatchReturnsClaimedDriverAndFare(t *testing.T) {
+	svc := New(&fakeRepo{claim: ports.Claim{DriverID: "driver-7", ClaimedAt: 1000}}, time.Second)
 
-	got, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1", RequestedAt: 42})
+	got, err := svc.Match(context.Background(), events.RidePricedEvent{
+		RideID: "ride-1", RequestedAt: 42, Price: 134.18, Currency: "INR", SurgeMultiplier: 1.5,
+	})
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
-	if got.RideID != "ride-1" || got.DriverID != "driver-7" || got.RequestedAt != 42 || got.Version != events.Version {
-		t.Fatalf("Match = %+v", got)
+	want := events.RideMatchedEvent{
+		Version: events.Version, RideID: "ride-1", DriverID: "driver-7", MatchedAt: 1000, RequestedAt: 42,
+		Price: 134.18, Currency: "INR", SurgeMultiplier: 1.5,
+	}
+	if got != want {
+		t.Fatalf("Match = %+v, want %+v", got, want)
 	}
 }
 
-func TestMatchReplayReturnsExistingDriver(t *testing.T) {
-	svc := New(&fakeRepo{driverID: "driver-7", replayed: true}, time.Second)
+func TestMatchReplayKeepsOriginalClaimTime(t *testing.T) {
+	svc := New(&fakeRepo{claim: ports.Claim{DriverID: "driver-7", ClaimedAt: 1000, Replayed: true}}, time.Second)
 
 	got, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1"})
-	if err != nil || got.DriverID != "driver-7" {
-		t.Fatalf("Match = %+v, %v", got, err)
+	if err != nil || got.DriverID != "driver-7" || got.MatchedAt != 1000 {
+		t.Fatalf("Match = %+v, %v; want driver-7 at the original claim time", got, err)
 	}
 }
 
@@ -69,7 +75,7 @@ func TestMatchClaimSurvivesCancelAndHasTimeout(t *testing.T) {
 
 	var claimErr error
 	var hasDeadline bool
-	repo := &fakeRepo{driverID: "driver-1", check: func(c context.Context) {
+	repo := &fakeRepo{claim: ports.Claim{DriverID: "driver-1"}, check: func(c context.Context) {
 		claimErr = c.Err()
 		_, hasDeadline = c.Deadline()
 	}}
