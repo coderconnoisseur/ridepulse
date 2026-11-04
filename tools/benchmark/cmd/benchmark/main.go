@@ -67,10 +67,10 @@ func parseLadder(s string) ([]ladderStep, error) {
 
 // riderMu guards currentRider so the signal handler can kill it cleanly.
 var (
-	riderMu       sync.Mutex
-	currentRider  *exec.Cmd
-	shutdownOnce  sync.Once
-	shutdownFlag  = make(chan struct{})
+	riderMu      sync.Mutex
+	currentRider *exec.Cmd
+	shutdownOnce sync.Once
+	shutdownFlag = make(chan struct{})
 )
 
 func main() {
@@ -126,10 +126,10 @@ func main() {
 		"actual_rps_in", "assignments_rps",
 		"match_success_rps", "match_failures_rps",
 		"publish_errors_rps",
-		"lock_conflicts_rps", "phantom_releases_rps",
+		"unmatched_rps", "dlq_rps",
 		"e2e_p50_ms", "e2e_p95_ms", "e2e_p99_ms",
 		"gateway_p95_ms", "match_p95_ms",
-		"success_rate_pct",
+		"success_rate_pct", "surge_multiplier",
 	}
 	if err := w.Write(header); err != nil {
 		log.Fatal(err)
@@ -316,8 +316,8 @@ func (p *promClient) collect(step ladderStep, window time.Duration) []string {
 	matchSuccess := p.queryOrLog(fmt.Sprintf("rate(matching_success_total[%s])", w))
 	matchFailures := p.queryOrLog(fmt.Sprintf("rate(matching_failures_total[%s])", w))
 	publishErrors := p.queryOrLog(fmt.Sprintf("rate(gateway_publish_errors_total[%s])", w))
-	lockConflicts := p.queryOrLog(fmt.Sprintf("rate(driver_lock_conflict_total[%s])", w))
-	phantomReleases := p.queryOrLog(fmt.Sprintf("rate(driver_lock_released_phantom_total[%s])", w))
+	unmatched := p.queryOrLog(fmt.Sprintf("sum(rate(unmatched_total[%s]))", w))
+	dlq := p.queryOrLog(fmt.Sprintf("rate(pricing_dlq_messages_total[%[1]s]) + rate(matching_dlq_messages_total[%[1]s]) + rate(assignment_dlq_messages_total[%[1]s])", w))
 
 	e2eP50 := p.queryOrLog(fmt.Sprintf("histogram_quantile(0.50, sum by (le) (rate(end_to_end_latency_seconds_bucket[%s])))", w))
 	e2eP95 := p.queryOrLog(fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(end_to_end_latency_seconds_bucket[%s])))", w))
@@ -325,6 +325,8 @@ func (p *promClient) collect(step ladderStep, window time.Duration) []string {
 
 	gwP95 := p.queryOrLog(fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket[%s])))", w))
 	matchP95 := p.queryOrLog(fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(matching_latency_seconds_bucket[%s])))", w))
+
+	surge := p.queryOrLog("pricing_surge_multiplier")
 
 	var successRate float64
 	if actualRPS > 0 {
@@ -345,14 +347,15 @@ func (p *promClient) collect(step ladderStep, window time.Duration) []string {
 		fmt.Sprintf("%.1f", matchSuccess),
 		fmt.Sprintf("%.1f", matchFailures),
 		fmt.Sprintf("%.2f", publishErrors),
-		fmt.Sprintf("%.1f", lockConflicts),
-		fmt.Sprintf("%.1f", phantomReleases),
+		fmt.Sprintf("%.1f", unmatched),
+		fmt.Sprintf("%.2f", dlq),
 		fmt.Sprintf("%.0f", e2eP50*1000),
 		fmt.Sprintf("%.0f", e2eP95*1000),
 		fmt.Sprintf("%.0f", e2eP99*1000),
 		fmt.Sprintf("%.0f", gwP95*1000),
 		fmt.Sprintf("%.0f", matchP95*1000),
 		fmt.Sprintf("%.1f", successRate),
+		fmt.Sprintf("%.1f", surge),
 	}
 }
 
@@ -366,10 +369,10 @@ func formatDuration(d time.Duration) string {
 // printStepSummary writes a compact human-readable summary of the row that
 // was just recorded.
 func printStepSummary(step int, ls ladderStep, row []string) {
-	// row layout matches the CSV columns MINUS the leading "step" column.
+	// row layout matches the CSV columns, including the leading "step" column.
 	log.Printf(
-		"step %d done: target=%d rps → in=%s rps, assign=%s rps (success=%s%%), e2e p95=%s ms, match p95=%s ms, lock_conflicts=%s/s, phantom_rel=%s/s",
+		"step %d done: target=%d rps → in=%s rps, assign=%s rps (success=%s%%), e2e p95=%s ms, match p95=%s ms, unmatched=%s/s, dlq=%s/s",
 		step, ls.rps,
-		row[2], row[3], row[14], row[10], row[13], row[7], row[8],
+		row[3], row[4], row[15], row[11], row[14], row[8], row[9],
 	)
 }

@@ -1,10 +1,5 @@
 # RPS Benchmarking Setup — RidePulse
 
-> **Status:** local-only note. Not intended for the public repo.
-> Documents everything that had to change so the pipeline could be
-> loaded and measured honestly, plus how to actually run a benchmark
-> and interpret the results.
-
 ---
 
 ## 1. What was blocking a real RPS benchmark
@@ -99,10 +94,6 @@ the driver cluster (`[12.88, 12.94] × [77.58, 77.64]`). This overlaps
 the driver-simulator's spawn box (`[12.9, 12.92] × [77.6, 77.62]`) so
 every ride still finds candidates in Redis GEO — but rides no longer
 pile onto the same top-5 nearest drivers.
-
-Combined with the earlier tier-shuffle fix, hotspot contention is now
-proportional to actual demand density, not an artefact of the
-simulator.
 
 ### 2d. `api-gateway` metrics
 
@@ -245,7 +236,7 @@ Terminal output during a run:
 ... measurement window 30s ...
 step 3 done: target=200 rps → in=198.7 rps, assign=196.4 rps
    (success=98.8%), e2e p95=142 ms, match p95=98 ms,
-   lock_conflicts=12.3/s, phantom_rel=1.1/s
+   unmatched=2.3/s, dlq=0.00/s
 ```
 
 Stop at the step where either match success rate drops below ~95 % or
@@ -263,11 +254,12 @@ end-to-end p99 breaches your SLO — that's the ceiling.
 | `match_success_rps`       | `rate(matching_success_total[window])` — matcher success rate (before publish) |
 | `match_failures_rps`      | `rate(matching_failures_total[window])`                                 |
 | `publish_errors_rps`      | `rate(gateway_publish_errors_total[window])` — Kafka pushback signal    |
-| `lock_conflicts_rps`      | `rate(driver_lock_conflict_total[window])` — SETNX rejections           |
-| `phantom_releases_rps`    | `rate(driver_lock_released_phantom_total[window])` — phantom-lock guard activity |
+| `unmatched_rps`           | `sum(rate(unmatched_total[window]))` — rides recorded with no driver    |
+| `dlq_rps`                 | Sum of the three services' DLQ rates — should stay at zero              |
 | `e2e_p{50,95,99}_ms`      | `histogram_quantile` on `end_to_end_latency_seconds_bucket`, in ms      |
 | `gateway_p95_ms`          | `histogram_quantile(0.95)` on `gateway_request_duration_seconds`, in ms |
 | `match_p95_ms`            | `histogram_quantile(0.95)` on `matching_latency_seconds`, in ms         |
+| `surge_multiplier`        | `pricing_surge_multiplier` at the end of the window                     |
 | `success_rate_pct`        | `100 × assignments_rps / actual_rps_in`, clamped to 100                 |
 
 #### Manual run (if you don't want the CSV)
@@ -308,21 +300,18 @@ values use the defaults. Invalid values make the services exit at startup, excep
 | `HTTP_ADDR` | `:8080` (api-gateway), `:2114` (assignment) | api-gateway, assignment | HTTP listen address (also serves `/metrics`). |
 | `METRICS_ADDR` | `:2115` (pricing), `:2112` (matching) | pricing, matching | Metrics listen address. |
 | `MATCH_WORKERS` | `runtime.NumCPU() * 25` | matching | Matcher worker-pool size; positive integer. |
-| `REDIS_POOL_SIZE` | `MATCH_WORKERS * 5` | matching | Redis connection pool size; positive integer. Each worker runs up to 5 parallel `SETNX` attempts, while the go-redis default is only 10 x GOMAXPROCS. |
-| `MATCH_DEADLINE` | `500ms` | matching | Total per-match budget (Go duration); must exceed the 200 ms batch deadline. |
+| `REDIS_POOL_SIZE` | `MATCH_WORKERS` | matching | Redis connection pool size; positive integer. |
+| `PRICING_WORKERS` | `runtime.NumCPU() * 25` | pricing | Pricing worker-pool size; positive integer. |
+| `MATCH_DEADLINE` | `500ms` | matching | Timeout for one driver claim (Go duration, positive). |
 | `RIDER_URL` | `http://localhost:8080/rides` | rider-simulator | Gateway endpoint. |
 | `RIDER_RPS` | `500` | rider-simulator | Target requests per second. |
 | `RIDER_CONCURRENCY` | `200` | rider-simulator | Max in-flight requests. |
 | `DRIVER_COUNT` | `1000` | driver-simulator | Number of simulated drivers. |
 | `DRIVER_TRIP_DURATION` | `5s` | driver-simulator | How long an assigned driver stays busy. |
 
-**The ladder must be re-run.** Besides the driver-supply change below, the
-matcher defaults moved from `NumCPU * 5` workers and an 800 ms deadline to
-`NumCPU * 25` and 500 ms, and the rider simulator now paces with a batched
-ticker. None of these values has been measured: they are a starting point.
-Record `MATCH_WORKERS`, `MATCH_DEADLINE`, `DRIVER_COUNT` and
-`DRIVER_TRIP_DURATION` with every result set, and vary one at a time. The
-committed CSV predates all of it.
+**Record the settings with every result set.** That means `MATCH_WORKERS`, `MATCH_DEADLINE`, `PRICING_WORKERS`, `DRIVER_COUNT` and `DRIVER_TRIP_DURATION`, and vary one at a time. The committed CSV uses the defaults.
+
+**Check Kafka lag as well as the CSV.** A low matched rate can come from a backlog at any stage, and `kafka-consumer-groups --all-groups --describe` shows which stage it's in. Start each run from a clean stack, and confirm one ride completes before starting the ladder.
 
 #### Driver supply and DLQ topics (added with the correctness work)
 
@@ -338,8 +327,7 @@ is controlled by environment variables on the driver simulator:
 
 Steady-state throughput is bounded by roughly `DRIVER_COUNT /
 DRIVER_TRIP_DURATION` matches per second, so set both deliberately and
-record them with the results. `tools/benchmark/benchmark-results.csv`
-predates this change and is not comparable; re-run the ladder.
+record them with the results.
 
 Each consumer dead-letters failures to `<topic>.dlq` (`ride.requested.dlq`,
 `ride.priced.dlq`, `ride.matched.dlq`, `ride.unmatched.dlq`), auto-created on
@@ -407,19 +395,13 @@ histogram_quantile(0.95, sum by (le) (rate(matching_latency_seconds_bucket[1m]))
 
 ```
 rate(matching_failures_total[1m])
-rate(driver_lock_conflict_total[1m])
-rate(driver_lock_released_phantom_total[1m])
 ```
 
-- Rising `driver_lock_conflict_total` with flat `matching_success_total`
-  → hotspot / demand exceeds supply. Not a code bug; either sparser
-  pickups or more drivers.
-- Rising `driver_lock_released_phantom_total` → phantom-lock guard is
-  actively doing work. Good sign, expected under contention.
-- Rising `matching_failures_total` with high `driver_lock_conflict_total`
-  → the outer match deadline (`MATCH_DEADLINE`, default 500 ms) isn't
-  enough to traverse all the batches for these rides. Consider larger radius
-  or fewer batches before failing.
+- Rising `matching_failures_total` means free drivers ran out. Compare with
+  `DRIVER_COUNT / DRIVER_TRIP_DURATION`. It isn't a code bug; add drivers or
+  shorten trips.
+- Rising `matching_retries_total` means claims or publishes are failing or
+  timing out. A short burst at startup is normal while connections warm up.
 
 Failures are now visible downstream as well: matching publishes
 `ride.unmatched` and assignment-service counts it.
@@ -431,8 +413,7 @@ histogram_quantile(0.95, sum by (le) (rate(unmatched_end_to_end_latency_seconds_
 ```
 
 `reason="no_drivers"` is supply exhaustion (check `DRIVER_COUNT` against
-`DRIVER_TRIP_DURATION`); `reason="match_deadline"` is the match budget running
-out. The two counters should track each other; a gap means unmatched events
+`DRIVER_TRIP_DURATION`). The two counters should track each other; a gap means unmatched events
 are in flight or in `ride.unmatched.dlq`. Note that `success_rate_pct` in the
 CSV is `assignments_rps / actual_rps_in`, so unmatched rides count as
 failures there.
@@ -474,17 +455,14 @@ ack policy and `10 ms` batch timeout are what you'd tune first.
 
 - All four `rate(*_total[1m])` curves overlap.
 - End-to-end p95 ≈ 50–150 ms.
-- `driver_lock_conflict_total` near zero.
-- `driver_lock_released_phantom_total` near zero.
+- `matching_retries_total` and the DLQ counters near zero.
 
 ### 5b. Expected shape as load climbs
 
-- Batch 1 lock conflicts start showing (`driver_lock_conflict_total`
-  rises linearly with RPS).
-- Phantom-lock releases rise proportionally (the fix is working).
-- End-to-end p95 climbs as batches 2 / 3 / 4 get exercised.
-- Match success rate stays close to 100 % — the whole point of the
-  deadline + phantom + shuffle fix stack.
+- `assignments_total` levels off at the driver supply rate, and
+  `unmatched_total` takes the rest.
+- End-to-end p95 stays roughly flat until the machine runs short of resources.
+- `matching_retries_total` and the DLQ counters stay near zero.
 
 ### 5c. Expected failure mode at the ceiling
 
@@ -566,10 +544,6 @@ of scope for the "can we measure at all?" pass:
 - ~~Env-var config~~ is done: every service reads `KAFKA_BROKERS`,
   `REDIS_ADDR`, `HTTP_ADDR` / `METRICS_ADDR` and, for matching,
   `MATCH_WORKERS` / `MATCH_DEADLINE` (table in section 3c).
-- **Fail-fast on batch 1.** A fully contended first batch still waits out the
-  match deadline and holds a worker.
-- **Re-run the ladder** with the new matcher defaults before trusting any
-  number.
 - ~~Graceful shutdown~~, ~~silent-drop consumer retries~~ and
   ~~match-failed vs publish-failed~~ are addressed by the shared consumer
   runner; see [at-least-once-consumers.md](at-least-once-consumers.md).

@@ -1,11 +1,5 @@
 # At-Least-Once Consumers — pricing, matching, assignment
 
-> **Status:** local-only note. Not intended for the public repo.
-> Documents the offset-commit and failure-handling bug shared by the three
-> Kafka consumers, the shared runner that replaced it
-> (`pkg/kafkaconsumer`), the epoch mechanism that handles consumer-group
-> rewinds, handler panic recovery, and what is still not covered.
-
 ---
 
 ## 1. The bug in one paragraph
@@ -141,8 +135,10 @@ On SIGINT/SIGTERM the service context is cancelled. Then:
 `Run` never closes the reader or the DLQ writer. After the runner drains,
 each service's `app.Run` shuts down its HTTP server, then closes the reader,
 the DLQ writer and the publisher (matching also closes Redis). Fatal errors
-(a fetch error not caused by shutdown, a synchronous commit error, a DLQ
-write failure) take the same drain path and are returned to `main`.
+(a closed reader, a synchronous commit error, a DLQ write failure) take the
+same drain path and are returned to `main`. Other fetch errors, such as a
+leader election, are logged and retried with backoff (100 ms, doubling up to
+5 s), because they can pass by themselves.
 
 ### 3e. Handler panics
 
@@ -208,7 +204,7 @@ why the handlers have to tolerate duplicates (section 5).
 
 | Service | Workers | Decode failure | Handler failure |
 |---|---|---|---|
-| pricing | `NumCPU` | Permanent → `ride.requested.dlq` | Publish error retried, then DLQ |
+| pricing | `PRICING_WORKERS` (default `NumCPU × 25`) | Permanent → `ride.requested.dlq` | Publish error retried, then DLQ |
 | matching | `MATCH_WORKERS` (default `NumCPU × 25`) | Permanent → `ride.priced.dlq` | See below |
 | assignment (`ride.matched`) | 4 | Permanent → `ride.matched.dlq` | Cannot fail after decode |
 | assignment (`ride.unmatched`) | 4 | Permanent → `ride.unmatched.dlq` | Cannot fail after decode |
@@ -228,22 +224,17 @@ error.
 
 **Matching** splits `Match` errors in `app.go`:
 
-- `ErrNoDriversAvailable`, and `context.DeadlineExceeded` when it is the
-  outer match deadline (`matchCtx.Err() != nil`), are business failures.
-  The handler logs and publishes a `ride.unmatched` event (reason
-  `no_drivers` or `match_deadline`, 300 ms publish budget), then returns
-  `nil` and the offset is committed. If that publish fails the error is
-  returned, so the runner retries and eventually dead-letters it like any
-  other infrastructure error. See
+- `ErrNoDriversAvailable` is a business outcome. The handler logs and publishes
+  a `ride.unmatched` event (reason `no_drivers`, 2 s publish budget), then
+  returns `nil` and the offset is committed. If that publish fails the error is
+  returned, so the runner retries and eventually dead-letters it like any other
+  infrastructure error. See
   [driver-state-model.md](driver-state-model.md#4b-the-unmatched-path).
-- Any other `Match` error is returned. That covers
-  Redis failures, any `DeadlineExceeded` that is not the outer match deadline,
-  and every `AssignDriver` failure (wrapped in `matching.ErrAssign`, such as
-  the detached assign timeout), which is retried even if the outer deadline
-  has expired by then. The runner retries and eventually dead-letters these. Retrying is safe because
-  `Match` replays an existing assignment instead of matching again
+- Any other `Match` error is returned, including a claim timeout. The runner
+  retries and eventually dead-letters these. Retrying is safe because the claim
+  replays an existing assignment instead of matching again
   (see [driver-state-model.md](driver-state-model.md)).
-- Publishing `ride.matched` has its own 300 ms budget; a publish failure is
+- Publishing `ride.matched` has its own 2 s budget; a publish failure is
   returned, retried and dead-lettered like any other infrastructure error.
 
 ---
@@ -254,7 +245,7 @@ error.
   before the 1 s commit flush redelivers the message, as does a rewind
   (3f). Pricing is a pure function plus a publish, so a duplicate
   `ride.priced` is harmless to pricing itself but flows downstream. Matching
-  deduplicates by ride through `ride:driver:<rideID>`. Assignment-service
+  deduplicates by ride through `ride:outcome:<rideID>`. Assignment-service
   deduplicates in its store: the first `ride.matched` for a ride is recorded
   and counted in `assignments_total` and `end_to_end_latency_seconds`; later
   ones only increment `assignment_duplicates_total`. A ride has one outcome:
@@ -287,7 +278,7 @@ error.
 | `pricing_retries_total`, `matching_retries_total` | Handler attempts that failed and were retried. |
 | `pricing_dlq_messages_total`, `matching_dlq_messages_total`, `assignment_dlq_messages_total` | Messages written to the service's DLQ topic. Should stay at zero in a healthy run. |
 | `match_idempotent_replays_total` | Matching saw a ride that already had a driver (retry or redelivery). Non-zero is evidence of redelivery being absorbed. |
-| `match_unmatched_published_total{reason}` | `ride.unmatched` events matching published, by `no_drivers` / `match_deadline`. |
+| `match_unmatched_published_total{reason}` | `ride.unmatched` events matching published, with reason `no_drivers`. |
 | `assignment_duplicates_total`, `unmatched_duplicates_total` | Redelivered `ride.matched` / `ride.unmatched` events assignment-service recognized and ignored. |
 | `pricing_events_consumed_total` | Handler **attempts**, retries included. Compare with `pricing_events_published_total`. |
 
@@ -311,11 +302,9 @@ clean shutdown and restart.
 - **Full rewind detection.** Re-assignment above the last tracked offset is
   not recognized (3f).
 - **Phase 2 throughput work.** Multi-partition topics, and the batch-1
-  fail-fast for slow-fail matches in matching. The `MATCH_WORKERS` /
-  `MATCH_DEADLINE` defaults (`NumCPU × 25`, 500 ms) are unmeasured.
+  fail-fast for slow-fail matches in matching. See the README for measured
+  results with the current defaults.
 - **Persistent assignment store**, so dedupe survives a restart.
-- **No end-to-end run yet.** The epoch handling, panic path, `ride.unmatched`
-  flow and assignment dedupe are covered by hermetic unit tests only; none of
-  it has been run against real Kafka and Redis.
-- **Benchmark ladder must be re-run.** `tools/benchmark/benchmark-results.csv`
-  predates these changes; see the note in the README.
+- **No automated end-to-end test.** The panic path and epoch handling are
+  covered by hermetic unit tests only. The `ride.unmatched` flow, dead-lettering
+  and assignment dedupe were also checked by hand against real Kafka and Redis.

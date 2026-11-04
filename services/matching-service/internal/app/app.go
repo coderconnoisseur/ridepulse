@@ -9,32 +9,24 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/pkg/events"
+	"ridepulse/pkg/health"
 	"ridepulse/services/matching-service/internal/kafka"
 	"ridepulse/services/matching-service/internal/matching"
 	"ridepulse/services/matching-service/internal/metrics"
 	"ridepulse/services/matching-service/internal/redis"
 )
 
-// Deadlines for the per-ride processing pipeline.
-//
-// defaultMatchDeadline is the default total wall-clock budget the matcher has
-// for finding a driver (Config.MatchDeadline, MATCH_DEADLINE). It must be
-// strictly greater than matching.BatchDeadline so that at least one batch
-// attempt fits inside it. A successful match's p95 was ~80 ms, so 500 ms
-// still fits two full batches and halves the time a worker is held on a
-// failure compared with the previous 800 ms.
-//
-// publishDeadline is a SEPARATE budget for emitting ride.matched to Kafka.
-// It was previously sharing the match deadline via a single 300 ms context,
-// which meant a match that took 250 ms left publish with 50 ms — often not
-// enough for a Kafka WriteMessages round-trip with RequireOne, and the
-// "match succeeded but publish timed out" failure mode was silent.
+// publishDeadline bounds one Kafka write. It must comfortably exceed the writer's
+// batch window plus a broker round trip: a publish that times out can still
+// reach the broker, so a tight budget turns slow writes into retries and
+// duplicate events, which add more load.
 const (
-	defaultMatchDeadline = 500 * time.Millisecond
-	publishDeadline      = 300 * time.Millisecond
+	publishDeadline = 2 * time.Second
 
 	shutdownTimeout = 5 * time.Second
+	// readyTimeout bounds the whole /ready probe (Kafka dial + Redis PING).
+	readyTimeout = 1 * time.Second
 )
 
 // Run serves metrics and consumes RidePriced events until ctx is cancelled,
@@ -42,10 +34,19 @@ const (
 func Run(ctx context.Context, cfg Config) error {
 	metrics.Register()
 
-	// Dedicated mux so the scrape endpoint can't collide with anything
-	// registered on http.DefaultServeMux.
+	// --- Dependencies ---
+	driverRepo := redis.NewDriverRepository(cfg.RedisAddr, cfg.RedisPoolSize)
+	matcher := matching.New(driverRepo, cfg.MatchDeadline)
+
+	// Dedicated mux so the scrape and probe endpoints can't collide with
+	// anything registered on http.DefaultServeMux.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/health", health.Liveness())
+	mux.Handle("/ready", health.Readiness(readyTimeout, map[string]health.Check{
+		"kafka": health.Kafka(cfg.KafkaBrokers),
+		"redis": driverRepo.Ping,
+	}))
 	server := &http.Server{
 		Addr:         cfg.MetricsAddr,
 		Handler:      mux,
@@ -59,14 +60,10 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	// --- Dependencies ---
-	driverRepo := redis.NewDriverRepository(cfg.RedisAddr, cfg.RedisPoolSize)
-	matcher := matching.New(driverRepo)
-
 	consumer := kafka.NewKafkaConsumer(cfg.KafkaBrokers, cfg.MatchWorkers)
 	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
-	runErr := consumer.Run(ctx, newHandler(matcher, publisher, cfg.MatchDeadline))
+	runErr := consumer.Run(ctx, newHandler(matcher, publisher))
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -86,82 +83,47 @@ func Run(ctx context.Context, cfg Config) error {
 	return runErr
 }
 
-// isBusinessFailure reports whether a Match error is a business outcome
-// (commit and move on) rather than an infrastructure failure (retry).
-// DeadlineExceeded counts only when the outer match deadline expired
-// (matchCtxErr != nil); any other deadline, such as the detached assign
-// timeout or a pool wait, is retried, which is safe via ride:driver replay.
-// An AssignDriver failure (matching.ErrAssign) is always retried, even if the
-// outer deadline has since expired.
-func isBusinessFailure(err, matchCtxErr error) bool {
-	if errors.Is(err, matching.ErrAssign) {
-		return false
-	}
-	return errors.Is(err, matching.ErrNoDriversAvailable) ||
-		(errors.Is(err, context.DeadlineExceeded) && matchCtxErr != nil)
-}
-
 // matcherAPI and eventPublisher are the handler's collaborators, narrowed so
 // the handler can be tested with fakes.
 type matcherAPI interface {
-	Match(ctx context.Context, event domain.RidePricedEvent) (domain.RideMatchedEvent, error)
+	Match(ctx context.Context, event events.RidePricedEvent) (events.RideMatchedEvent, error)
 }
 
 type eventPublisher interface {
-	PublishRideMatched(ctx context.Context, event domain.RideMatchedEvent) error
-	PublishRideUnmatched(ctx context.Context, event domain.RideUnmatchedEvent) error
+	PublishRideMatched(ctx context.Context, event events.RideMatchedEvent) error
+	PublishRideUnmatched(ctx context.Context, event events.RideUnmatchedEvent) error
 }
 
 // newHandler builds the per-ride handler: match, then publish ride.matched,
-// or on a business failure publish ride.unmatched so the rider is told.
-func newHandler(matcher matcherAPI, publisher eventPublisher, matchDeadline time.Duration) func(context.Context, domain.RidePricedEvent) error {
-	return func(ctx context.Context, event domain.RidePricedEvent) error {
-		matchCtx, matchCancel := context.WithTimeout(ctx, matchDeadline)
-		defer matchCancel()
-
-		match, err := matcher.Match(matchCtx, event)
-		if err != nil {
-			if isBusinessFailure(err, matchCtx.Err()) {
-				// No driver / match deadline is a business outcome, not a
-				// retryable failure: log it, tell the rider, commit the offset.
-				log.Printf("matching failed for ride %s: %v", event.RideID, err)
-				reason := unmatchedReason(err)
-				publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
-				defer publishCancel()
-				// A publish failure is returned so the runner retries it.
-				if perr := publisher.PublishRideUnmatched(publishCtx, domain.RideUnmatchedEvent{
-					RideID:      event.RideID,
-					Reason:      reason,
-					RequestedAt: event.RequestedAt,
-					FailedAt:    time.Now().UnixNano(),
-				}); perr != nil {
-					return perr
-				}
-				metrics.MatchUnmatchedPublished.WithLabelValues(reason).Inc()
-				return nil
+// or if no driver is free publish ride.unmatched so the rider is told. Any
+// error is returned so the runner retries and then dead-letters the message.
+// Retries are safe: Match replays an existing assignment instead of matching
+// again.
+func newHandler(matcher matcherAPI, publisher eventPublisher) func(context.Context, events.RidePricedEvent) error {
+	return func(ctx context.Context, event events.RidePricedEvent) error {
+		match, err := matcher.Match(ctx, event)
+		if errors.Is(err, matching.ErrNoDriversAvailable) {
+			log.Printf("no driver for ride %s", event.RideID)
+			publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
+			defer publishCancel()
+			if perr := publisher.PublishRideUnmatched(publishCtx, events.RideUnmatchedEvent{
+				Version:     events.Version,
+				RideID:      event.RideID,
+				Reason:      events.ReasonNoDrivers,
+				RequestedAt: event.RequestedAt,
+				FailedAt:    time.Now().UnixNano(),
+			}); perr != nil {
+				return perr
 			}
-			// Redis/infra error: return it so the runner retries (and then
-			// dead-letters). Retries are safe: Match replays an existing
-			// assignment via ride:driver instead of matching again.
+			metrics.MatchUnmatchedPublished.WithLabelValues(events.ReasonNoDrivers).Inc()
+			return nil
+		}
+		if err != nil {
 			return err
 		}
 
-		// Publish gets its OWN budget derived from the handler ctx, not from
-		// matchCtx. A match that used most of the match deadline must not starve
-		// the Kafka write of its round-trip budget. A publish failure is
-		// returned so the message is retried and then dead-lettered.
 		publishCtx, publishCancel := context.WithTimeout(ctx, publishDeadline)
 		defer publishCancel()
 		return publisher.PublishRideMatched(publishCtx, match)
 	}
-}
-
-// unmatchedReason maps a business-failure error to the ride.unmatched reason.
-// Mirrors isBusinessFailure: anything that is not ErrNoDriversAvailable is the
-// outer match deadline.
-func unmatchedReason(err error) string {
-	if errors.Is(err, matching.ErrNoDriversAvailable) {
-		return "no_drivers"
-	}
-	return "match_deadline"
 }
