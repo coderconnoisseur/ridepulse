@@ -11,10 +11,11 @@ import (
 type Config struct {
 	MetricsAddr  string
 	KafkaBrokers []string
+	RedisAddr    string
 	Workers      int
 }
 
-// LoadConfig reads METRICS_ADDR, KAFKA_BROKERS and PRICING_WORKERS via getenv.
+// LoadConfig reads METRICS_ADDR, KAFKA_BROKERS, REDIS_ADDR and PRICING_WORKERS via getenv.
 func LoadConfig(getenv func(string) string) (Config, error) {
 	brokers, err := parseBrokers(envOr(getenv, "KAFKA_BROKERS", "localhost:9092"))
 	if err != nil {
@@ -34,6 +35,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	return Config{
 		MetricsAddr:  envOr(getenv, "METRICS_ADDR", ":2115"),
 		KafkaBrokers: brokers,
+		RedisAddr:    envOr(getenv, "REDIS_ADDR", "localhost:6379"),
 		Workers:      workers,
 	}, nil
 }

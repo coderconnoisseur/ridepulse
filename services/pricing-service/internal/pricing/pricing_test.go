@@ -8,7 +8,7 @@ import (
 )
 
 func priceBetween(pickup, drop events.Location) float64 {
-	return ComputePrice(events.RideRequestedEvent{Pickup: pickup, Drop: drop}).Price
+	return ComputePrice(events.RideRequestedEvent{Pickup: pickup, Drop: drop}, 1.0).Price
 }
 
 func TestComputePriceChargesRealDistance(t *testing.T) {
@@ -39,12 +39,32 @@ func TestComputePriceChargesRealDistance(t *testing.T) {
 
 func TestComputePriceCopiesRideFields(t *testing.T) {
 	pickup := events.Location{Lat: 12.9, Lng: 77.6}
-	got := ComputePrice(events.RideRequestedEvent{RideID: "r1", Pickup: pickup, RequestedAt: 42})
+	got := ComputePrice(events.RideRequestedEvent{RideID: "r1", Pickup: pickup, RequestedAt: 42}, 1.5)
 
 	if got.Version != events.Version || got.RideID != "r1" || got.Pickup != pickup || got.RequestedAt != 42 {
 		t.Fatalf("event fields not carried over: %+v", got)
 	}
-	if got.Currency != "INR" || got.SurgeMultiplier != 1.0 {
+	if got.Currency != "INR" || got.SurgeMultiplier != 1.5 {
 		t.Fatalf("currency = %q, surge = %v", got.Currency, got.SurgeMultiplier)
+	}
+}
+
+func TestComputePriceAppliesSurgeToWholeFare(t *testing.T) {
+	pickup := events.Location{Lat: 12.9, Lng: 77.6}
+	drop := events.Location{Lat: 13.0, Lng: 77.6}
+	normal := ComputePrice(events.RideRequestedEvent{Pickup: pickup, Drop: drop}, 1.0).Price
+	surged := ComputePrice(events.RideRequestedEvent{Pickup: pickup, Drop: drop}, 2.0).Price
+	if math.Abs(surged-2*normal) > 0.01 {
+		t.Fatalf("surged = %.2f, want twice %.2f", surged, normal)
+	}
+}
+
+func TestComputePriceRoundsToPaise(t *testing.T) {
+	got := ComputePrice(events.RideRequestedEvent{
+		Pickup: events.Location{Lat: 12.91, Lng: 77.61},
+		Drop:   events.Location{Lat: 12.97, Lng: 77.59},
+	}, 1.0).Price
+	if got != math.Round(got*100)/100 {
+		t.Fatalf("price %v has more than 2 decimals", got)
 	}
 }

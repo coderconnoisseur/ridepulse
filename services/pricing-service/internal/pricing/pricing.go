@@ -13,14 +13,16 @@ const (
 	earthRadiusKM = 6371.0
 )
 
-// ComputePrice builds the ride.priced event for a ride.requested event.
-func ComputePrice(event events.RideRequestedEvent) events.RidePricedEvent {
+// ComputePrice builds the ride.priced event for a ride.requested event. The
+// surge multiplier applies to the whole fare, and the price is in whole paise.
+func ComputePrice(event events.RideRequestedEvent, surge float64) events.RidePricedEvent {
+	fare := (baseFareINR + distanceKM(event.Pickup, event.Drop)*perKMINR) * surge
 	return events.RidePricedEvent{
 		Version:         events.Version,
 		RideID:          event.RideID,
-		Price:           baseFareINR + distanceKM(event.Pickup, event.Drop)*perKMINR,
+		Price:           math.Round(fare*100) / 100,
 		Currency:        "INR",
-		SurgeMultiplier: 1.0, // surge is not implemented yet
+		SurgeMultiplier: surge,
 		Pickup:          event.Pickup,
 		RequestedAt:     event.RequestedAt,
 	}

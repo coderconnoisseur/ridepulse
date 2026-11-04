@@ -18,9 +18,9 @@ func TestLoadConfig(t *testing.T) {
 		want    Config
 		wantErr bool
 	}{
-		{"defaults", nil, Config{MetricsAddr: ":2115", KafkaBrokers: []string{"localhost:9092"}, Workers: defaultWorkers}, false},
-		{"overrides", map[string]string{"METRICS_ADDR": ":9000", "KAFKA_BROKERS": "a:1, b:2", "PRICING_WORKERS": "7"},
-			Config{MetricsAddr: ":9000", KafkaBrokers: []string{"a:1", "b:2"}, Workers: 7}, false},
+		{"defaults", nil, Config{MetricsAddr: ":2115", KafkaBrokers: []string{"localhost:9092"}, RedisAddr: "localhost:6379", Workers: defaultWorkers}, false},
+		{"overrides", map[string]string{"METRICS_ADDR": ":9000", "KAFKA_BROKERS": "a:1, b:2", "PRICING_WORKERS": "7", "REDIS_ADDR": "r:6"},
+			Config{MetricsAddr: ":9000", KafkaBrokers: []string{"a:1", "b:2"}, RedisAddr: "r:6", Workers: 7}, false},
 		{"zero workers", map[string]string{"PRICING_WORKERS": "0"}, Config{}, true},
 		{"non-numeric workers", map[string]string{"PRICING_WORKERS": "many"}, Config{}, true},
 		{"empty broker entry", map[string]string{"KAFKA_BROKERS": "a:1,,b:2"}, Config{}, true},
