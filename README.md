@@ -103,8 +103,8 @@ sequenceDiagram
 
     Rider->>GW: POST /rides {pickup, drop}
     GW->>GW: validate lat and lng, new ride_id, requested_at
+    GW->>Kafka: ride.requested, rider gets 503 if this fails
     GW-->>Rider: 201 {ride_id, status REQUESTED}
-    GW->>Kafka: ride.requested
     Kafka->>Pricing: ride.requested
     Pricing->>Kafka: ride.priced {price, currency, surge}
     Kafka->>Match: ride.priced
@@ -229,6 +229,8 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 ---
 
 ## Documentation
+
+New here? Start with **[How RidePulse works, in simple terms](docs/how-it-works.md)**.
 
 Deep-dive engineering notes on the correctness and reliability changes:
 
