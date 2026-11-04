@@ -30,9 +30,45 @@ From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benc
 
 RidePulse follows an event-driven microservices design where each component has a single, well-scoped responsibility:
 
-![RidePulse Architecture](./assets/Architecture.png)
+```mermaid
+flowchart LR
+    RS["rider-simulator<br/>load generator"] -->|"HTTP POST /rides"| GW["api-gateway"]
+    GW -->|"produce"| T1[["ride.requested"]]
+    T1 -->|"group pricing-service"| PR["pricing-service"]
+    PR -->|"produce"| T2[["ride.priced"]]
+    T2 -->|"group matching-service"| MS["matching-service"]
+    MS -->|"produce, on match"| T3[["ride.matched"]]
+    MS -->|"produce, on failure"| T4[["ride.unmatched"]]
+    T3 -->|"group assignment-service"| AS["assignment-service"]
+    T4 -->|"group assignment-service-unmatched"| AS
 
-*The diagram shows the core Kafka/Redis pipeline. The API gateway (in front of `ride.requested`) and the assignment service (consuming `ride.matched`) are shown in the table and in [Request Flow](#request-flow) below.*
+    PR -.->|"after retries"| D1[("ride.requested.dlq")]
+    MS -.->|"after retries"| D2[("ride.priced.dlq")]
+    AS -.->|"after retries"| D3[("ride.matched.dlq")]
+    AS -.->|"after retries"| D4[("ride.unmatched.dlq")]
+
+    subgraph Redis
+        GEO[("drivers:locations<br/>GEO index")]
+        LOCK[("driver:lock:{id}<br/>SETNX, 3 s TTL")]
+        BUSY[("driver:assigned:{id}<br/>10 min safety TTL")]
+        RIDE[("ride:driver:{rideID}<br/>1 h idempotency record")]
+    end
+    MS -->|"GEORADIUS 50 km"| GEO
+    MS -->|"lock candidates"| LOCK
+    MS -->|"assign: set busy, set ride, ZREM, DEL lock"| BUSY
+    MS -->|"assign"| RIDE
+    DS["driver-simulator"] -->|"GEOADD while not busy"| GEO
+    DS -->|"release after DRIVER_TRIP_DURATION"| BUSY
+
+    PROM[("Prometheus")] -.->|"scrape /metrics"| GW
+    PROM -.-> PR
+    PROM -.-> MS
+    PROM -.-> AS
+```
+
+Every arrow above is a real code path. Each consumer runs in its own consumer group, and a message that still fails after retries is dead-lettered to `<topic>.dlq` with `x-error` and `x-original-*` headers. The driver simulator is not an event consumer: it writes locations straight to Redis and deletes `driver:assigned:{id}` when a trip ends.
+
+The `ride.*` payloads share one contract, [`pkg/events`](pkg/events/events.go): snake_case JSON and a `v` version field (currently `1`).
 
 | Component | Role |
 |---|---|
@@ -42,6 +78,8 @@ RidePulse follows an event-driven microservices design where each component has 
 | **Matching Service** | Consumes `ride.priced`, runs geospatial search + atomic driver locking, assigns the driver (idempotent per ride), publishes `ride.matched`; business failures (`no_drivers`, `match_deadline`) publish `ride.unmatched`; infrastructure failures retried, then dead-lettered to `ride.priced.dlq` |
 | **Assignment Service** | Consumes `ride.matched` and `ride.unmatched`, records each ride's outcome once (duplicates ignored), exposes end-to-end latency metrics and `GET /rides/<id>`; dead-letters to `ride.matched.dlq` / `ride.unmatched.dlq` |
 | **Driver Simulator** | Continuously updates live driver locations in Redis GEO; keeps assigned drivers out of the GEO set and releases them after `DRIVER_TRIP_DURATION` |
+| **Event contracts** (`pkg/events`) | Shared snake_case JSON types for `ride.requested`, `ride.priced`, `ride.matched` and `ride.unmatched`; every service imports them instead of keeping its own copy |
+| **Shared runtime** (`pkg/kafkaconsumer`, `pkg/health`) | At-least-once consumer runner with ordered commits and DLQs; liveness and readiness handlers |
 | **Kafka** | Decouples every stage of the pipeline |
 | **Redis** | GEO indexing, distributed driver locking (Lua safe-unlock) and driver assignment state |
 | **Prometheus** | Latency, contention, and success-rate monitoring at every stage |
@@ -50,37 +88,45 @@ RidePulse follows an event-driven microservices design where each component has 
 
 ## Request Flow
 
+One ride, from `POST /rides` to a lookup of its outcome:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Rider as rider-simulator
+    participant GW as api-gateway
+    participant Kafka
+    participant Pricing as pricing-service
+    participant Match as matching-service
+    participant Redis
+    participant Assign as assignment-service
+
+    Rider->>GW: POST /rides {pickup, drop}
+    GW->>GW: validate lat and lng, new ride_id, requested_at
+    GW-->>Rider: 201 {ride_id, status REQUESTED}
+    GW->>Kafka: ride.requested
+    Kafka->>Pricing: ride.requested
+    Pricing->>Kafka: ride.priced {price, currency, surge}
+    Kafka->>Match: ride.priced
+    Match->>Redis: GEORADIUS drivers:locations within 50 km
+    Note over Match,Redis: tier-preserving shuffle, batches of 5 SETNX driver:lock
+    alt a free driver locks and assigns
+        Match->>Redis: set driver:assigned, set ride:driver, ZREM from GEO, DEL lock
+        Match->>Kafka: ride.matched
+        Kafka->>Assign: ride.matched
+        Assign->>Assign: record the matched outcome once
+    else no driver, or match deadline passed
+        Match->>Kafka: ride.unmatched {reason}
+        Kafka->>Assign: ride.unmatched
+        Assign->>Assign: record the unmatched outcome once
+    end
+    Rider->>Assign: GET /rides/{ride_id}
+    Assign-->>Rider: matched or unmatched outcome, 404 until recorded
 ```
-RiderSimulator ──HTTP POST /rides──▶ API Gateway
-                                        │  (stamps RequestedAt)
-                                        ▼
-                                Kafka: ride.requested
-                                        │
-                                        ▼
-                                 Pricing Service
-                                        │
-                                        ▼
-                                 Kafka: ride.priced
-                                        │
-                                        ▼
-                                 Matching Service
-                                        │
-                                        ├── Redis GEORADIUS → nearby drivers
-                                        ├── tier-preserving shuffle
-                                        ├── SETNX + TTL → atomic driver lock
-                                        │   (batch losers explicitly released)
-                                        ├── atomic assign: driver:assigned, ride:driver,
-                                        │   remove from GEO (replays return same driver)
-                                        ├─ matched ──▶ Kafka: ride.matched
-                                        └─ no driver / deadline ──▶ Kafka: ride.unmatched
-                                        │
-                                        ▼
-                                Assignment Service
-                                        │
-                                        ▼
-              records the ride's outcome once; end_to_end_latency
-              (GET /rides/<id> returns matched or unmatched)
-```
+
+Latency is measured from `requested_at` (stamped at the gateway) to the terminal consumer, so the same number covers every stage.
+
+---
 
 ---
 
@@ -177,7 +223,8 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 - **Rewind detection is partial.** The offset tracker detects a rewind only when a re-fetched offset is at or below the last offset it tracked. A partition re-assigned starting *above* that offset is not detected, so the committed offset can move backwards and messages are redelivered. That stays within at-least-once, and handlers absorb duplicates.
 - **Two readers, two consumer groups.** assignment-service reads `ride.matched` in group `assignment-service` and `ride.unmatched` in group `assignment-service-unmatched`. A shared group would make the leader's metadata request for both topics fail as a whole while `ride.unmatched` does not exist yet (it is created lazily on the first business failure), stalling the success path too; with separate groups a missing `ride.unmatched` topic only delays the unmatched reader, and rebalances are independent.
 - **In-memory assignment store.** The assignment service keeps ride outcomes (matched and unmatched) in maps for benchmark verification; nothing is persisted, so after a restart a redelivered event is counted as new.
-- **Test coverage is unit-level.** Unit tests cover the tier-preserving shuffle, the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery) and the Redis Lua scripts (locking, assignment, release) against an in-process Redis (miniredis). Nothing yet exercises real Kafka/Redis end to end: the unmatched path, the epoch-stamped commits and the new matcher defaults have not been run against a live cluster. Next: integration tests against containerized Kafka and Redis.
+- **Test coverage is unit-level.** Unit tests cover the tier-preserving shuffle, the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), the Redis Lua scripts (locking, assignment, release) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes. Nothing yet exercises real Kafka/Redis end to end: the unmatched path, the epoch-stamped commits and the new matcher defaults have not been run against a live cluster. Next: integration tests against containerized Kafka and Redis.
+- **Readiness probes are shallow.** `/ready` checks that a broker accepts a TCP connection (and Redis answers `PING`). It does not verify that the topics exist or that consumer groups are assigned partitions.
 
 ---
 
@@ -245,6 +292,17 @@ Prometheus scrape targets:
 | assignment-service | `:2114/metrics` |
 
 Confirm all four are `up` at http://localhost:9090/targets.
+
+**Health endpoints.** Each service answers two probes on the same port as its HTTP or metrics server:
+
+| Service | Port | `GET /health` (liveness) | `GET /ready` (readiness) |
+|---|---|---|---|
+| api-gateway | `HTTP_ADDR` (`:8080`) | 200 while the process serves HTTP | Kafka |
+| pricing-service | `METRICS_ADDR` (`:2115`) | 200 while the process serves HTTP | Kafka |
+| matching-service | `METRICS_ADDR` (`:2112`) | 200 while the process serves HTTP | Kafka and Redis `PING` |
+| assignment-service | `HTTP_ADDR` (`:2114`) | 200 while the process serves HTTP | Kafka |
+
+`/ready` returns `200 {"status":"ready"}` when every check passes, or `503` with the failing checks listed under `failing`. The Kafka check succeeds when any one broker in `KAFKA_BROKERS` accepts a TCP connection. All checks run concurrently under a 1 s budget, and none creates topics or keys.
 
 **Configuration.** Every service reads its endpoints from environment variables; unset or blank values fall back to the defaults below, so the commands above work unchanged on one host. `KAFKA_BROKERS` is a comma-separated list. Invalid values make the services exit at startup, except rider-simulator, which falls back to the default for a non-numeric or non-positive `RIDER_RPS` / `RIDER_CONCURRENCY`; double-check these when running the ladder.
 
