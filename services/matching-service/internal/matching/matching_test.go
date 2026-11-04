@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"ridepulse/services/matching-service/internal/domain"
+	"ridepulse/pkg/events"
 	"ridepulse/services/matching-service/internal/ports"
 )
 
@@ -82,7 +82,7 @@ func TestShuffleWithinTiersActuallyShuffles(t *testing.T) {
 // tier when len(drivers) is not a clean multiple of tierSize.
 func TestShuffleWithinTiersHandlesRaggedLastTier(t *testing.T) {
 	drivers := []string{"a", "b", "c", "d", "e", "f", "g"} // 7 items
-	shuffleWithinTiers(drivers, 5)                          // → tiers of 5 and 2
+	shuffleWithinTiers(drivers, 5)                         // → tiers of 5 and 2
 
 	seen := stringSet(drivers)
 	for _, want := range []string{"a", "b", "c", "d", "e", "f", "g"} {
@@ -201,7 +201,7 @@ func TestMatchReplaysExistingAssignment(t *testing.T) {
 	}
 	svc := New(repo)
 
-	got, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1", RequestedAt: 42})
+	got, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1", RequestedAt: 42})
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestMatchLockLostOnFirstBatchMovesToNextBatch(t *testing.T) {
 	}
 	svc := New(repo)
 
-	got, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	got, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1"})
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestMatchUsesDriverReturnedByAssign(t *testing.T) {
 	}
 	svc := New(repo)
 
-	got, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	got, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1"})
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestMatchAssignErrorReleasesLockAndFails(t *testing.T) {
 	}
 	svc := New(repo)
 
-	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	_, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1"})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want %v", err, boom)
 	}
@@ -294,7 +294,7 @@ func TestMatchAssignErrorReleasesLockAndFails(t *testing.T) {
 func TestMatchNoDriversReturnsErrNoDriversAvailable(t *testing.T) {
 	svc := New(&fakeRepo{})
 
-	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	_, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1"})
 	if !errors.Is(err, ErrNoDriversAvailable) {
 		t.Fatalf("err = %v, want ErrNoDriversAvailable", err)
 	}
@@ -309,7 +309,7 @@ func TestMatchAllAssignsLockLostReturnsErrNoDriversAvailable(t *testing.T) {
 	}
 	svc := New(repo)
 
-	_, err := svc.Match(context.Background(), domain.RidePricedEvent{RideID: "ride-1"})
+	_, err := svc.Match(context.Background(), events.RidePricedEvent{RideID: "ride-1"})
 	if !errors.Is(err, ErrNoDriversAvailable) {
 		t.Fatalf("err = %v, want ErrNoDriversAvailable", err)
 	}
@@ -327,7 +327,7 @@ func TestMatchAssignIgnoresExpiredMatchDeadline(t *testing.T) {
 	svc := New(repo)
 	svc.repo = assignCtxRecorder{fakeRepo: repo, errOut: &assignCtxErr}
 
-	got, err := svc.Match(ctx, domain.RidePricedEvent{RideID: "ride-1"})
+	got, err := svc.Match(ctx, events.RidePricedEvent{RideID: "ride-1"})
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
