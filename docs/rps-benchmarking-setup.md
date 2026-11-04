@@ -309,6 +309,7 @@ values use the defaults. Invalid values make the services exit at startup, excep
 | `METRICS_ADDR` | `:2115` (pricing), `:2112` (matching) | pricing, matching | Metrics listen address. |
 | `MATCH_WORKERS` | `runtime.NumCPU() * 25` | matching | Matcher worker-pool size; positive integer. |
 | `REDIS_POOL_SIZE` | `MATCH_WORKERS * 5` | matching | Redis connection pool size; positive integer. Each worker runs up to 5 parallel `SETNX` attempts, while the go-redis default is only 10 x GOMAXPROCS. |
+| `PRICING_WORKERS` | `runtime.NumCPU() * 25` | pricing | Pricing worker-pool size; positive integer. |
 | `MATCH_DEADLINE` | `500ms` | matching | Total per-match budget (Go duration); must exceed the 200 ms batch deadline. |
 | `RIDER_URL` | `http://localhost:8080/rides` | rider-simulator | Gateway endpoint. |
 | `RIDER_RPS` | `500` | rider-simulator | Target requests per second. |
@@ -316,13 +317,9 @@ values use the defaults. Invalid values make the services exit at startup, excep
 | `DRIVER_COUNT` | `1000` | driver-simulator | Number of simulated drivers. |
 | `DRIVER_TRIP_DURATION` | `5s` | driver-simulator | How long an assigned driver stays busy. |
 
-**The ladder must be re-run.** Besides the driver-supply change below, the
-matcher defaults moved from `NumCPU * 5` workers and an 800 ms deadline to
-`NumCPU * 25` and 500 ms, and the rider simulator now paces with a batched
-ticker. None of these values has been measured: they are a starting point.
-Record `MATCH_WORKERS`, `MATCH_DEADLINE`, `DRIVER_COUNT` and
-`DRIVER_TRIP_DURATION` with every result set, and vary one at a time. The
-committed CSV predates all of it.
+**Record the settings with every result set.** That means `MATCH_WORKERS`, `MATCH_DEADLINE`, `PRICING_WORKERS`, `DRIVER_COUNT` and `DRIVER_TRIP_DURATION`, and vary one at a time. The committed CSV uses the defaults.
+
+**Check Kafka lag as well as the CSV.** A low matched rate can come from a backlog at any stage, and `kafka-consumer-groups --all-groups --describe` shows which stage it's in. Start each run from a clean stack, and confirm one ride completes before starting the ladder.
 
 #### Driver supply and DLQ topics (added with the correctness work)
 
@@ -338,8 +335,7 @@ is controlled by environment variables on the driver simulator:
 
 Steady-state throughput is bounded by roughly `DRIVER_COUNT /
 DRIVER_TRIP_DURATION` matches per second, so set both deliberately and
-record them with the results. `tools/benchmark/benchmark-results.csv`
-predates this change and is not comparable; re-run the ladder.
+record them with the results.
 
 Each consumer dead-letters failures to `<topic>.dlq` (`ride.requested.dlq`,
 `ride.priced.dlq`, `ride.matched.dlq`, `ride.unmatched.dlq`), auto-created on

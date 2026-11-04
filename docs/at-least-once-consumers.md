@@ -141,8 +141,10 @@ On SIGINT/SIGTERM the service context is cancelled. Then:
 `Run` never closes the reader or the DLQ writer. After the runner drains,
 each service's `app.Run` shuts down its HTTP server, then closes the reader,
 the DLQ writer and the publisher (matching also closes Redis). Fatal errors
-(a fetch error not caused by shutdown, a synchronous commit error, a DLQ
-write failure) take the same drain path and are returned to `main`.
+(a closed reader, a synchronous commit error, a DLQ write failure) take the
+same drain path and are returned to `main`. Other fetch errors, such as a
+leader election, are logged and retried with backoff (100 ms, doubling up to
+5 s), because they can pass by themselves.
 
 ### 3e. Handler panics
 
@@ -208,7 +210,7 @@ why the handlers have to tolerate duplicates (section 5).
 
 | Service | Workers | Decode failure | Handler failure |
 |---|---|---|---|
-| pricing | `NumCPU` | Permanent → `ride.requested.dlq` | Publish error retried, then DLQ |
+| pricing | `PRICING_WORKERS` (default `NumCPU × 25`) | Permanent → `ride.requested.dlq` | Publish error retried, then DLQ |
 | matching | `MATCH_WORKERS` (default `NumCPU × 25`) | Permanent → `ride.priced.dlq` | See below |
 | assignment (`ride.matched`) | 4 | Permanent → `ride.matched.dlq` | Cannot fail after decode |
 | assignment (`ride.unmatched`) | 4 | Permanent → `ride.unmatched.dlq` | Cannot fail after decode |
@@ -311,11 +313,9 @@ clean shutdown and restart.
 - **Full rewind detection.** Re-assignment above the last tracked offset is
   not recognized (3f).
 - **Phase 2 throughput work.** Multi-partition topics, and the batch-1
-  fail-fast for slow-fail matches in matching. The `MATCH_WORKERS` /
-  `MATCH_DEADLINE` defaults (`NumCPU × 25`, 500 ms) are unmeasured.
+  fail-fast for slow-fail matches in matching. See the README for measured
+  results with the current defaults.
 - **Persistent assignment store**, so dedupe survives a restart.
-- **No end-to-end run yet.** The epoch handling, panic path, `ride.unmatched`
-  flow and assignment dedupe are covered by hermetic unit tests only; none of
-  it has been run against real Kafka and Redis.
-- **Benchmark ladder must be re-run.** `tools/benchmark/benchmark-results.csv`
-  predates these changes; see the note in the README.
+- **No automated end-to-end test.** The panic path and epoch handling are
+  covered by hermetic unit tests only. The `ride.unmatched` flow, dead-lettering
+  and assignment dedupe were also checked by hand against real Kafka and Redis.

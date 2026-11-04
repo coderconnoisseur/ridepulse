@@ -237,7 +237,5 @@ should be about `DRIVER_COUNT` (locked drivers are still in the set).
   the saturation point of the ladder moves; the supply model is also a new
   tuning dimension (`DRIVER_COUNT` against `DRIVER_TRIP_DURATION`).
 - **Hard Redis time bounds** (`ContextTimeoutEnabled`), see section 4.
-- **Benchmark ladder must be re-run** before any number is compared with the
-  committed CSV. The matcher defaults (`MATCH_WORKERS` = `NumCPU × 25`,
-  `MATCH_DEADLINE` = 500 ms) are unmeasured, and the unmatched path has not
-  been exercised against real Kafka and Redis.
+- **Contention caps matches below supply.** The committed run peaked near 134
+  matches/sec, against about 200/sec of driver supply. See the README.

@@ -70,7 +70,7 @@ Each ride gets 500 ms to find a driver, and each group of 5 gets 200 ms of that.
 
 ### Telling the system when no driver is found
 
-A ride that can't be matched isn't silently dropped. It's recorded as unmatched with a reason: `no_drivers` or `match_deadline`.
+A ride that can't be matched isn't silently dropped. It's recorded as unmatched with a reason: `no_drivers` or `match_deadline`. Under heavy load, `no_drivers` can also mean the nearest 20 drivers were all reserved by other rides at that moment.
 
 ### Never losing a ride
 
@@ -87,6 +87,10 @@ A failed message is retried 3 times, waiting a little longer each time. If it st
 ### Drivers who stay busy
 
 A matched driver is out of search results for the length of the trip (5 seconds by default in the simulator), then becomes available again. That makes driver supply limited, as it is in real life. See [the driver state note](driver-state-model.md).
+
+### Surviving Kafka hiccups
+
+If Kafka is briefly unavailable, for example while it's starting up, a service keeps retrying with growing pauses instead of quitting.
 
 ### Shutting down cleanly
 
@@ -127,8 +131,10 @@ curl http://localhost:2114/rides/<ride_id>
 
 **Not yet proven**
 
-- **No live run since the reliability work.** Everything since then is covered by automated tests only. It hasn't been run against real Kafka and Redis.
-- **Benchmark numbers are out of date.** The published run reached 99.7% of rides matched at 50 requests per second, and fell to 66% at 200. It predates the reliability work, so it doesn't describe the current code.
+- **No automated test with real Kafka and Redis.** The main flows were checked by hand on a live stack, but nothing repeats those checks automatically.
+- **Performance comes from one run on one machine.** All rides matched at up to 100 requests per second, and it peaked at about 134 matched rides per second. Past that, rides increasingly collide over the same drivers.
+- **It breaks down at very high load.** At a target of 800 requests per second, the gateway fell to about 45 and started returning errors. The cause hasn't been found.
+- **A small share of rides can get stuck under overload.** In the benchmark, 213 of about 42,000 rides ended up in a dead letter topic instead of getting a result.
 
 **Not built yet**
 

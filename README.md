@@ -11,12 +11,12 @@ Event-driven ride matching in Go: Kafka between every stage, Redis GEO for nearb
 
 ## Results at a glance
 
-From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv); Windows dev box, single-partition Kafka, single Redis). These numbers predate the at-least-once consumer and driver-state changes: drivers now stay busy for `DRIVER_TRIP_DURATION`, so the ladder must be re-run before results are comparable.
+From the committed benchmark run ([`benchmark-results.csv`](tools/benchmark/benchmark-results.csv)): one run on an 8-core Windows machine that also hosted Docker, Kafka, Redis and the load generator, with single-partition topics, 1,000 drivers and 5 s trips.
 
-- **50 RPS:** 99.7 % of rides matched, end-to-end p50 34 ms / p95 94 ms (gateway to assignment).
-- **Peak throughput:** the gateway took in ~400 RPS; the pipeline completed ~150 assignments/sec.
-- **Matching stayed fast under load:** successful-match p95 was 33–84 ms at every step up to 800 RPS target.
-- **Where it breaks:** success drops to 66 % at 200 RPS and below 50 % from 300 RPS, and end-to-end p95 hits the 10 s histogram cap. The primary bottleneck identified is matcher worker-pool starvation (see [Known limitations](#known-limitations-and-next-steps)).
+- **Healthy up to 100 RPS:** 100 % of rides matched at 50 and 100 RPS, end-to-end p95 about 170 ms.
+- **Peak throughput:** about 134 matched rides/sec.
+- **Past that, contention limits matching:** at a 300 RPS target, 46 % of rides matched and the rest mostly got a recorded unmatched result. End-to-end p95 stayed near 1 s, with no Kafka backlog left after the run.
+- **Where it breaks:** at an 800 RPS target, gateway intake collapsed to about 45 RPS, with publish errors and a 2 s gateway p95. The cause isn't diagnosed (see [Known limitations](#known-limitations-and-next-steps)).
 
 **Core focus areas:**
 - Low-latency geospatial matching
@@ -195,22 +195,23 @@ Key exports:
 
 The [`tools/benchmark`](tools/benchmark) runner walks a configurable RPS ladder against a running cluster, samples Prometheus at each step, and writes one CSV row per step.
 
-> **Note:** the committed results below predate the at-least-once and driver-state changes. Drivers now stay busy for `DRIVER_TRIP_DURATION` after a match, so supply is finite and the ladder must be re-run before new numbers are comparable with this CSV.
 
 The latest run is committed here:
 
 📊 **[tools/benchmark/benchmark-results.csv](tools/benchmark/benchmark-results.csv)**
 
-Headline from that run (Windows dev box, single-partition Kafka, single Redis, ~8 cores):
+| Target RPS | Gateway intake | Matched/sec | Matched % | E2E p50 | E2E p95 | Match p95 |
+|---|---|---|---|---|---|---|
+| 50 | 50 | 50 | 100 % | 40 ms | 172 ms | 74 ms |
+| 100 | 100 | 100 | 100 % | 41 ms | 156 ms | 79 ms |
+| 200 | 154 | 134 | 87 % | 415 ms | 790 ms | 970 ms |
+| 300 | 281 | 130 | 46 % | 484 ms | 998 ms | 858 ms |
+| 500 | 221 | 121 | 55 % | 675 ms | 1,231 ms | 931 ms |
+| 800 | 45 | 23 | 50 % | 2,311 ms | 4,615 ms | 947 ms |
 
-| What | Value |
-|---|---|
-| Peak intake at gateway | ~400 RPS |
-| Peak end-to-end assignment throughput | ~150 rides/sec |
-| Peak "healthy" throughput (>95 % success) | ~50 RPS |
-| Successful `matching_latency_seconds` p95 | stayed 33–84 ms across every step |
+"Matched %" is matched rides divided by gateway intake. Rides that aren't matched mostly get a recorded `ride.unmatched` result, so it isn't a loss rate. This is a single run on a shared machine, so treat the numbers as indicative.
 
-The primary bottleneck in that run was matcher pool starvation from slow-fail matches: under contention, ~30 % of matches consumed workers for the full 800 ms match deadline, blowing past the `NumCPU × 5` worker capacity of the time. The matcher defaults have since changed (`MATCH_WORKERS` = `NumCPU × 25`, `MATCH_DEADLINE` = 500 ms) but the new values have **not been measured**; the ladder must be re-run. Fail-fast on batch 1 saturation and multi-partition Kafka topics are still open.
+**What the live run found.** The first run showed about 21,700 rides queued at pricing against about 200 at matching: pricing's 8 workers each block on a Kafka write, capping the pipeline well below the matcher. Moving to 200 workers (`PRICING_WORKERS`) removed the backlog. At 100 RPS, end-to-end p95 fell from 1,581 ms to 156 ms; at a 300 RPS target, from the 10 s histogram cap to about 1 s. Pricing's timeout dead-letters fell from 184 to 0.
 
 See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook, ladder shape, PromQL queries, and interpretation notes.
 
@@ -218,12 +219,16 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 
 ## Known limitations and next steps
 
-- **Matcher pool starvation: new defaults, still unmeasured.** The pool now defaults to `runtime.NumCPU() * 25` workers (`MATCH_WORKERS`) and the match deadline to 500 ms (`MATCH_DEADLINE`), down from `NumCPU * 5` and 800 ms. Slow-fail matches still hold a worker until the deadline, and no ladder has been run with these values, so they are a starting point, not a result. Next: re-run the ladder, and fail fast when the first batch is fully contended instead of waiting out the deadline.
+- **Lock contention caps matching near 134 rides/sec.** That's below the 200/sec that 1,000 drivers on 5 s trips could supply. Next: fail fast when the first batch is fully contended, and widen the candidate pool.
+- **`no_drivers` is overstated under load.** The reason is also used when all 20 nearest drivers were merely locked by other rides.
+- **Match p95 exceeds the 500 ms deadline under load** (about 900 ms). The likely cause is that Redis calls don't enforce context timeouts (`ContextTimeoutEnabled` is off), but this hasn't been confirmed.
+- **Rides can still reach the dead-letter topic under overload.** 213 of about 42,000 rides in the run ended in `ride.priced.dlq`. In the first run, those dead letters were all `context deadline exceeded`. A timed-out publish can also succeed anyway, which causes the duplicates the consumers then ignore (about 1,900 in the run).
+- **The 800 RPS collapse is undiagnosed.** Gateway intake fell to about 45 RPS with publish errors. Everything shares one machine, so resource exhaustion is possible, but it hasn't been isolated.
 - **Single-partition Kafka topics.** One partition per topic caps consumer parallelism per service. Next: create topics with more partitions, partition by ride ID and run multiple consumers per stage. Until then the rewind handling below is not exercised.
 - **Rewind detection is partial.** The offset tracker detects a rewind only when a re-fetched offset is at or below the last offset it tracked. A partition re-assigned starting *above* that offset is not detected, so the committed offset can move backwards and messages are redelivered. That stays within at-least-once, and handlers absorb duplicates.
 - **Two readers, two consumer groups.** assignment-service reads `ride.matched` in group `assignment-service` and `ride.unmatched` in group `assignment-service-unmatched`. A shared group would make the leader's metadata request for both topics fail as a whole while `ride.unmatched` does not exist yet (it is created lazily on the first business failure), stalling the success path too; with separate groups a missing `ride.unmatched` topic only delays the unmatched reader, and rebalances are independent.
 - **In-memory assignment store.** The assignment service keeps ride outcomes (matched and unmatched) in maps for benchmark verification; nothing is persisted, so after a restart a redelivered event is counted as new.
-- **Test coverage is unit-level.** Unit tests cover the tier-preserving shuffle, the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), the Redis Lua scripts (locking, assignment, release) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes. Nothing yet exercises real Kafka/Redis end to end: the unmatched path, the epoch-stamped commits and the new matcher defaults have not been run against a live cluster. Next: integration tests against containerized Kafka and Redis.
+- **Test coverage is unit-level.** Unit tests cover the tier-preserving shuffle, the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), the Redis Lua scripts (locking, assignment, release) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes. No automated test uses real Kafka or Redis. The matched and unmatched paths, dead-lettering, duplicate handling, driver release and restart recovery were checked by hand against a live stack, but consumer-group rewinds weren't. Next: integration tests against containerized Kafka and Redis.
 - **Readiness probes are shallow.** `/ready` checks that a broker accepts a TCP connection (and Redis answers `PING`). It does not verify that the topics exist or that consumer groups are assigned partitions.
 
 ---
@@ -316,6 +321,7 @@ Confirm all four are `up` at http://localhost:9090/targets.
 | `METRICS_ADDR` | `:2115` (pricing), `:2112` (matching) | pricing, matching | Metrics listen address. |
 | `MATCH_WORKERS` | `runtime.NumCPU() * 25` | matching | Matcher worker-pool size; positive integer. |
 | `REDIS_POOL_SIZE` | `MATCH_WORKERS * 5` | matching | Redis connection pool size; positive integer. Each worker runs up to 5 parallel `SETNX` attempts, while the go-redis default is only 10 x GOMAXPROCS. |
+| `PRICING_WORKERS` | `runtime.NumCPU() * 25` | pricing | Pricing worker-pool size; positive integer. Each worker blocks on a Kafka publish, so this caps pipeline throughput. |
 | `MATCH_DEADLINE` | `500ms` | matching | Total per-match budget (Go duration); must exceed the 200 ms batch deadline. |
 | `DRIVER_COUNT` | `1000` | driver-simulator | Number of simulated drivers. |
 | `DRIVER_TRIP_DURATION` | `5s` | driver-simulator | How long an assigned driver stays busy (Go duration). |
@@ -323,7 +329,7 @@ Confirm all four are `up` at http://localhost:9090/targets.
 | `RIDER_RPS` | `500` | rider-simulator | Target requests per second. |
 | `RIDER_CONCURRENCY` | `200` | rider-simulator | Max in-flight requests; sends beyond it are counted as dropped. |
 
-The `MATCH_WORKERS` and `MATCH_DEADLINE` defaults have not been benchmarked; treat them as untested until the ladder is re-run.
+The committed benchmark uses these defaults.
 
 ### 3. Send load
 
