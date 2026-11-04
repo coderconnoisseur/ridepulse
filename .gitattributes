@@ -1,0 +1,2 @@
+demo.bat text eol=crlf
+demo.sh text eol=lf

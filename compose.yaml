@@ -1,0 +1,138 @@
+# The RidePulse live demo: everything starts with `docker compose up -d`, and the
+# dashboard is at http://localhost:8090.
+#
+# It uses the published image if there is one, and otherwise builds it from this
+# repo. deployment/docker-compose.yml is separate: it only starts the
+# infrastructure, for running the services by hand.
+name: ridepulse
+
+x-ridepulse: &ridepulse
+  image: ghcr.io/coderconnoisseur/ridepulse:latest
+  build:
+    context: .
+    dockerfile: deployment/Dockerfile
+  restart: unless-stopped
+  environment: &env
+    KAFKA_BROKERS: kafka:9092
+    REDIS_ADDR: redis:6379
+  depends_on: &ready
+    kafka-setup:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx256m
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  # Creates the topics up front, so services and the dashboard never start
+  # against a missing topic.
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        for t in ride.requested ride.priced ride.matched ride.unmatched \
+                 ride.requested.dlq ride.priced.dlq ride.matched.dlq ride.unmatched.dlq; do
+          kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$t" --partitions 1 --replication-factor 1 || exit 1
+        done
+
+  redis:
+    image: redis:7.2
+    healthcheck:
+      test: redis-cli ping | grep -q PONG
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api-gateway:
+    <<: *ridepulse
+    command: api-gateway
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+
+  pricing:
+    <<: *ridepulse
+    command: pricing-service
+
+  matching:
+    <<: *ridepulse
+    command: matching-service
+    # The dashboard's crash button acts on this container by name.
+    container_name: ridepulse-matching
+    # The dashboard restarts it itself, so the crash can be seen.
+    restart: "no"
+
+  assignment:
+    <<: *ridepulse
+    command: assignment-service
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+
+  driver-simulator:
+    <<: *ridepulse
+    command: driver-simulator
+    environment:
+      <<: *env
+      DRIVER_COUNT: "500"
+      DRIVER_TRIP_DURATION: 5s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    <<: *ridepulse
+    command: dashboard
+    ports:
+      # Only this machine can reach the dashboard. Its crash button uses the
+      # Docker socket below, and can only kill and start the matching container.
+      - "127.0.0.1:8090:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: wget -q -O /dev/null http://localhost:3000/health
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      api-gateway:
+        condition: service_started
+      pricing:
+        condition: service_started
+      matching:
+        condition: service_started
+      assignment:
+        condition: service_started
+      driver-simulator:
+        condition: service_started
