@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -34,10 +35,19 @@ type Simulator struct {
 	url    string
 }
 
+// maxIdleConns covers the highest concurrency the benchmark ladder uses. The
+// default of 2 idle connections per host would open a new TCP connection for
+// most requests and, at high RPS, exhaust ephemeral ports through TIME_WAIT.
+const maxIdleConns = 1000
+
 func New(url string) *Simulator {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = maxIdleConns
+	transport.MaxIdleConnsPerHost = maxIdleConns
 	return &Simulator{
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout:   5 * time.Second,
+			Transport: transport,
 		},
 		url: url,
 	}
@@ -59,6 +69,10 @@ var requests int64
 var errCount int64
 var totalLatency int64
 var dropped int64
+var errorsLogged int64
+
+// maxErrorsLogged keeps a failing run from flooding the log.
+const maxErrorsLogged = 20
 
 func (s *Simulator) sendRide(ctx context.Context) {
 	req := RideRequest{}
@@ -79,7 +93,12 @@ func (s *Simulator) sendRide(ctx context.Context) {
 	if err != nil || (resp != nil && resp.StatusCode >= 400) {
 		atomic.AddInt64(&errCount, 1)
 	}
+	if err != nil && atomic.AddInt64(&errorsLogged, 1) <= maxErrorsLogged {
+		log.Printf("send ride: %v", err)
+	}
 	if resp != nil {
+		// A connection is only reused once its body has been read to the end.
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 }
