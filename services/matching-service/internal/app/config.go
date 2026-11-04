@@ -6,9 +6,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"ridepulse/services/matching-service/internal/matching"
 )
+
+// defaultMatchDeadline bounds one driver claim against Redis.
+const defaultMatchDeadline = 500 * time.Millisecond
 
 // Config holds matching-service's environment-derived settings.
 type Config struct {
@@ -35,8 +36,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		}
 	}
 
-	// Each worker runs up to BatchSize parallel SETNX attempts.
-	poolSize := workers * matching.BatchSize
+	// Each worker holds one Redis connection at a time.
+	poolSize := workers
 	if raw := strings.TrimSpace(getenv("REDIS_POOL_SIZE")); raw != "" {
 		poolSize, err = strconv.Atoi(raw)
 		if err != nil || poolSize <= 0 {
@@ -50,8 +51,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("MATCH_DEADLINE %q is not a valid duration: %w", raw, err)
 		}
-		if deadline <= matching.BatchDeadline {
-			return Config{}, fmt.Errorf("MATCH_DEADLINE %q must be greater than the batch deadline %s", raw, matching.BatchDeadline)
+		if deadline <= 0 {
+			return Config{}, fmt.Errorf("MATCH_DEADLINE %q must be positive", raw)
 		}
 	}
 

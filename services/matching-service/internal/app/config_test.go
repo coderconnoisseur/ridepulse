@@ -5,8 +5,6 @@ import (
 	"runtime"
 	"testing"
 	"time"
-
-	"ridepulse/services/matching-service/internal/matching"
 )
 
 func env(m map[string]string) func(string) string {
@@ -19,7 +17,7 @@ func TestLoadConfig(t *testing.T) {
 		KafkaBrokers:  []string{"localhost:9092"},
 		RedisAddr:     "localhost:6379",
 		MatchWorkers:  runtime.NumCPU() * 25,
-		RedisPoolSize: runtime.NumCPU() * 25 * matching.BatchSize,
+		RedisPoolSize: runtime.NumCPU() * 25,
 		MatchDeadline: 500 * time.Millisecond,
 	}
 	tests := []struct {
@@ -34,12 +32,12 @@ func TestLoadConfig(t *testing.T) {
 			"MATCH_WORKERS": "7", "MATCH_DEADLINE": "1s",
 		}, Config{
 			MetricsAddr: ":9", KafkaBrokers: []string{"a:1", "b:2"}, RedisAddr: "r:6",
-			MatchWorkers: 7, RedisPoolSize: 7 * matching.BatchSize, MatchDeadline: time.Second,
+			MatchWorkers: 7, RedisPoolSize: 7, MatchDeadline: time.Second,
 		}, false},
 		{"pool size override", map[string]string{"REDIS_POOL_SIZE": "42"},
 			func() Config { c := defaults; c.RedisPoolSize = 42; return c }(), false},
 		{"pool size follows workers", map[string]string{"MATCH_WORKERS": "3"},
-			func() Config { c := defaults; c.MatchWorkers = 3; c.RedisPoolSize = 3 * matching.BatchSize; return c }(), false},
+			func() Config { c := defaults; c.MatchWorkers = 3; c.RedisPoolSize = 3; return c }(), false},
 		{"pool size zero", map[string]string{"REDIS_POOL_SIZE": "0"}, Config{}, true},
 		{"pool size negative", map[string]string{"REDIS_POOL_SIZE": "-1"}, Config{}, true},
 		{"pool size not a number", map[string]string{"REDIS_POOL_SIZE": "big"}, Config{}, true},
@@ -48,9 +46,9 @@ func TestLoadConfig(t *testing.T) {
 		{"workers negative", map[string]string{"MATCH_WORKERS": "-3"}, Config{}, true},
 		{"workers not a number", map[string]string{"MATCH_WORKERS": "many"}, Config{}, true},
 		{"deadline not a duration", map[string]string{"MATCH_DEADLINE": "500"}, Config{}, true},
-		{"deadline equals batch deadline", map[string]string{"MATCH_DEADLINE": "200ms"}, Config{}, true},
-		{"deadline below batch deadline", map[string]string{"MATCH_DEADLINE": "100ms"}, Config{}, true},
-		{"deadline just above batch deadline", map[string]string{"MATCH_DEADLINE": "201ms"},
+		{"deadline zero", map[string]string{"MATCH_DEADLINE": "0s"}, Config{}, true},
+		{"deadline negative", map[string]string{"MATCH_DEADLINE": "-1s"}, Config{}, true},
+		{"deadline override", map[string]string{"MATCH_DEADLINE": "201ms"},
 			func() Config { c := defaults; c.MatchDeadline = 201 * time.Millisecond; return c }(), false},
 	}
 	for _, tt := range tests {

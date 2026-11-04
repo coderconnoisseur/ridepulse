@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -11,55 +10,12 @@ import (
 	"ridepulse/services/matching-service/internal/matching"
 )
 
-func TestIsBusinessFailure(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		ctx  error
-		want bool
-	}{
-		{"no drivers", matching.ErrNoDriversAvailable, nil, true},
-		{"wrapped no drivers", fmt.Errorf("match: %w", matching.ErrNoDriversAvailable), nil, true},
-		{"outer match deadline", context.DeadlineExceeded, context.DeadlineExceeded, true},
-		{"inner deadline, match ctx alive", context.DeadlineExceeded, nil, false},
-		{"redis error", errors.New("dial tcp: connection refused"), nil, false},
-		{"canceled", context.Canceled, nil, false},
-		{"assign timeout after outer deadline", fmt.Errorf("%w: %w", matching.ErrAssign, context.DeadlineExceeded), context.DeadlineExceeded, false},
-	}
-	for _, tc := range cases {
-		if got := isBusinessFailure(tc.err, tc.ctx); got != tc.want {
-			t.Errorf("%s: isBusinessFailure(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
-		}
-	}
-}
-
-func TestUnmatchedReason(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want string
-	}{
-		{"no drivers", matching.ErrNoDriversAvailable, "no_drivers"},
-		{"wrapped no drivers", fmt.Errorf("match: %w", matching.ErrNoDriversAvailable), "no_drivers"},
-		{"deadline", context.DeadlineExceeded, "match_deadline"},
-	}
-	for _, tc := range cases {
-		if got := unmatchedReason(tc.err); got != tc.want {
-			t.Errorf("%s: unmatchedReason(%v) = %q, want %q", tc.name, tc.err, got, tc.want)
-		}
-	}
-}
-
 type fakeMatcher struct {
-	match       events.RideMatchedEvent
-	err         error
-	waitForDone bool // block until the match ctx expires, like a real slow match
+	match events.RideMatchedEvent
+	err   error
 }
 
-func (f fakeMatcher) Match(ctx context.Context, _ events.RidePricedEvent) (events.RideMatchedEvent, error) {
-	if f.waitForDone {
-		<-ctx.Done()
-	}
+func (f fakeMatcher) Match(context.Context, events.RidePricedEvent) (events.RideMatchedEvent, error) {
 	return f.match, f.err
 }
 
@@ -84,7 +40,7 @@ func (f *fakePublisher) PublishRideUnmatched(_ context.Context, e events.RideUnm
 
 func TestHandlerPublishesUnmatchedOnBusinessFailure(t *testing.T) {
 	pub := &fakePublisher{}
-	h := newHandler(fakeMatcher{err: matching.ErrNoDriversAvailable}, pub, time.Second)
+	h := newHandler(fakeMatcher{err: matching.ErrNoDriversAvailable}, pub)
 	before := time.Now().UnixNano()
 	if err := h(context.Background(), events.RidePricedEvent{RideID: "r1", RequestedAt: 42}); err != nil {
 		t.Fatalf("handler error: %v", err)
@@ -98,21 +54,10 @@ func TestHandlerPublishesUnmatchedOnBusinessFailure(t *testing.T) {
 	}
 }
 
-func TestHandlerUnmatchedOnMatchDeadline(t *testing.T) {
-	pub := &fakePublisher{}
-	h := newHandler(fakeMatcher{err: context.DeadlineExceeded, waitForDone: true}, pub, time.Millisecond)
-	if err := h(context.Background(), events.RidePricedEvent{RideID: "r2"}); err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-	if len(pub.unmatched) != 1 || pub.unmatched[0].Reason != "match_deadline" {
-		t.Fatalf("unmatched = %+v, want one match_deadline", pub.unmatched)
-	}
-}
-
 func TestHandlerReturnsUnmatchedPublishError(t *testing.T) {
 	boom := errors.New("kafka down")
 	pub := &fakePublisher{unmatchedErr: boom}
-	h := newHandler(fakeMatcher{err: matching.ErrNoDriversAvailable}, pub, time.Second)
+	h := newHandler(fakeMatcher{err: matching.ErrNoDriversAvailable}, pub)
 	if err := h(context.Background(), events.RidePricedEvent{RideID: "r3"}); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want publish error", err)
 	}
@@ -120,7 +65,7 @@ func TestHandlerReturnsUnmatchedPublishError(t *testing.T) {
 
 func TestHandlerInfraErrorPublishesNothing(t *testing.T) {
 	pub := &fakePublisher{}
-	h := newHandler(fakeMatcher{err: errors.New("redis down")}, pub, time.Second)
+	h := newHandler(fakeMatcher{err: errors.New("redis down")}, pub)
 	if err := h(context.Background(), events.RidePricedEvent{RideID: "r4"}); err == nil {
 		t.Fatal("want error")
 	}
@@ -131,7 +76,7 @@ func TestHandlerInfraErrorPublishesNothing(t *testing.T) {
 
 func TestHandlerPublishesMatchedOnSuccess(t *testing.T) {
 	pub := &fakePublisher{}
-	h := newHandler(fakeMatcher{match: events.RideMatchedEvent{RideID: "r5", DriverID: "d"}}, pub, time.Second)
+	h := newHandler(fakeMatcher{match: events.RideMatchedEvent{RideID: "r5", DriverID: "d"}}, pub)
 	if err := h(context.Background(), events.RidePricedEvent{RideID: "r5"}); err != nil {
 		t.Fatal(err)
 	}

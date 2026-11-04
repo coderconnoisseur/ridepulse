@@ -22,8 +22,7 @@ const (
 
 // Reasons carried by RideUnmatchedEvent.Reason.
 const (
-	ReasonNoDrivers     = "no_drivers"
-	ReasonMatchDeadline = "match_deadline"
+	ReasonNoDrivers = "no_drivers"
 )
 
 // Location is a WGS84 coordinate in degrees.
