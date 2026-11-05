@@ -6,54 +6,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-
 var (
-	RedisGeoLatency = prometheus.NewHistogram(
+	DriverClaimLatency = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "redis_geo_query_latency_seconds",
-			Help:    "Latency of Redis GEO queries",
+			Name:    "driver_claim_latency_seconds",
+			Help:    "Latency of the atomic claim of the nearest free driver, as seen by the client",
 			Buckets: prometheus.DefBuckets,
-		},
-	)
-
-	DriverLockLatency = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "driver_lock_latency_seconds",
-			Help:    "Latency of driver lock attempts",
-			Buckets: prometheus.DefBuckets,
-		},
-	)
-
-	DriverLockSuccess = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "driver_lock_success_total",
-			Help: "Total successful driver locks",
-		},
-	)
-
-	DriverLockConflict = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "driver_lock_conflict_total",
-			Help: "Total driver lock conflicts",
-		},
-	)
-	DriverLockReleasedPhantom = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "driver_lock_released_phantom_total",
-			Help: "Driver locks acquired by a batch goroutine but released because another goroutine had already been chosen as the batch winner. Non-zero values indicate the phantom-lock guard is doing work.",
-		},
-	)
-	NearbyDriversGauge = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "nearby_drivers_current",
-			Help: "Current number of nearby drivers",
 		},
 	)
 )
-
-
-
-
 
 var (
 	MatchRequests = prometheus.NewCounter(
@@ -100,14 +61,6 @@ var (
 		},
 	)
 
-	NearbyDrivers = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "nearby_driver_count",
-			Help:    "Number of nearby drivers",
-			Buckets: []float64{1, 5, 10, 20, 50, 100},
-		},
-	)
-
 	Retries = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "matching_retries_total",
@@ -141,15 +94,9 @@ func Register() {
 		MatchIdempotentReplays,
 		MatchUnmatchedPublished,
 		MatchLatency,
-		NearbyDrivers,
 		Goroutines,
 		Retries,
 		DLQMessages,
-		RedisGeoLatency,
-		NearbyDriversGauge,
-		DriverLockLatency,
-		DriverLockSuccess,
-		DriverLockConflict,
-		DriverLockReleasedPhantom,
+		DriverClaimLatency,
 	)
 }

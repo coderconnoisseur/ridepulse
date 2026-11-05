@@ -9,16 +9,23 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	goredis "github.com/redis/go-redis/v9"
 
-	"ridepulse/services/pricing-service/internal/domain"
+	"ridepulse/pkg/events"
+	"ridepulse/pkg/health"
 	"ridepulse/services/pricing-service/internal/kafka"
 	"ridepulse/services/pricing-service/internal/metrics"
 	"ridepulse/services/pricing-service/internal/pricing"
 )
 
 const (
-	publishTimeout  = 300 * time.Millisecond
+	publishTimeout  = 2 * time.Second
 	shutdownTimeout = 5 * time.Second
+	readyTimeout    = 1 * time.Second
+
+	// driverLocationsKey holds free drivers only; see driver-simulator and
+	// matching-service, which share it.
+	driverLocationsKey = "drivers:locations"
 )
 
 // Run serves metrics and consumes RideRequested events until ctx is
@@ -30,6 +37,10 @@ func Run(ctx context.Context, cfg Config) error {
 	// it can't collide with anything registered on http.DefaultServeMux.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/health", health.Liveness())
+	mux.Handle("/ready", health.Readiness(readyTimeout, map[string]health.Check{
+		"kafka": health.Kafka(cfg.KafkaBrokers),
+	}))
 	server := &http.Server{
 		Addr:         cfg.MetricsAddr,
 		Handler:      mux,
@@ -43,14 +54,30 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
+	// Surge reads the number of free drivers once per tick, never per ride, so a
+	// Redis problem can't slow pricing down.
+	surge := pricing.NewSurgeTracker()
+	rdb := goredis.NewClient(&goredis.Options{Addr: cfg.RedisAddr, ContextTimeoutEnabled: true})
+	surgeCtx, stopSurge := context.WithCancel(ctx)
+	surgeDone := make(chan struct{})
+	go func() {
+		defer close(surgeDone)
+		pricing.RunSurge(surgeCtx, surge, func(c context.Context) (int64, error) {
+			free, err := rdb.ZCard(c, driverLocationsKey).Result()
+			metrics.SurgeMultiplier.Set(surge.Current())
+			return free, err
+		}, pricing.SurgeTickInterval)
+	}()
+
 	consumer := kafka.NewKafkaConsumer(
 		cfg.KafkaBrokers,
 		"pricing-service",
 		"ride.requested",
+		cfg.Workers,
 	)
 	publisher := kafka.NewKafkaPublisher(cfg.KafkaBrokers)
 
-	runErr := consumer.Run(ctx, func(ctx context.Context, event domain.RideRequestedEvent) error {
+	runErr := consumer.Run(ctx, func(ctx context.Context, event events.RideRequestedEvent) error {
 		// Counts handler attempts (retries included); pricing_retries_total
 		// counts the retries among them.
 		metrics.EventsConsumed.Inc()
@@ -59,7 +86,8 @@ func Run(ctx context.Context, cfg Config) error {
 			metrics.ProcessingDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		priced := pricing.ComputePrice(event)
+		surge.RecordRide()
+		priced := pricing.ComputePrice(event, surge.Current())
 		pubCtx, cancel := context.WithTimeout(ctx, publishTimeout)
 		defer cancel()
 		if err := publisher.PublishRidePriced(pubCtx, priced); err != nil {
@@ -69,6 +97,12 @@ func Run(ctx context.Context, cfg Config) error {
 		metrics.EventsPublished.Inc()
 		return nil
 	})
+
+	stopSurge()
+	<-surgeDone
+	if err := rdb.Close(); err != nil {
+		log.Printf("pricing-service redis close: %v", err)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()

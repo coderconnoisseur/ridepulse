@@ -21,11 +21,13 @@ jobs:
           - pkg
           - services/api-gateway
           - services/assignment-service
+          - services/dashboard
           - services/driver-simulator
           - services/matching-service
           - services/pricing-service
           - services/rider-simulator
           - tools/benchmark
+          - tools/e2e
     env:
       # Build each module against its own go.mod/go.sum, not the workspace.
       GOWORK: "off"
@@ -49,3 +51,21 @@ jobs:
       # Unit tests are pure Go; none need Kafka or Redis.
       - name: go test
         run: go test -count=1 ./...
+
+  # Crashes the matching service under load on real Kafka and Redis, then checks
+  # the guarantees against the Kafka topics.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker compose build e2e
+
+      - name: Run the end-to-end test
+        run: docker compose run --rm e2e
+
+      - name: Service logs
+        if: failure()
+        run: docker compose logs --tail=50

@@ -3,6 +3,7 @@ go 1.25.6
 use (
 	../pkg
 	./api-gateway
+	./dashboard
 	./assignment-service
 	./driver-simulator
 	./matching-service
