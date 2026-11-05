@@ -305,6 +305,6 @@ clean shutdown and restart.
   fail-fast for slow-fail matches in matching. See the README for measured
   results with the current defaults.
 - **Persistent assignment store**, so dedupe survives a restart.
-- **No automated end-to-end test.** The panic path and epoch handling are
-  covered by hermetic unit tests only. The `ride.unmatched` flow, dead-lettering
-  and assignment dedupe were also checked by hand against real Kafka and Redis.
+- **End-to-end coverage is one scenario.** `tools/e2e` force-kills matching
+  under load in CI and checks the Kafka topics. The panic path and epoch
+  handling are covered by hermetic unit tests only.

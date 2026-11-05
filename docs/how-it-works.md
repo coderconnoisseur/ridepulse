@@ -113,7 +113,7 @@ Every stage reports speed, success and failure counts to Prometheus. The gateway
 
 ### Automatic checks on every change
 
-GitHub CI runs `go vet`, `go build` and the tests for every module on each pull request.
+GitHub CI runs `go vet`, `go build` and the tests for every module on each pull request. It also runs the full-system test described below.
 
 ## Trying it out
 
@@ -141,7 +141,7 @@ curl http://localhost:2114/rides/<ride_id>
 
 **Not yet proven**
 
-- **No automated test with real Kafka and Redis.** The main flows were checked on a live stack, including force-killing services under load, but nothing in the repo repeats those checks automatically.
+- **The automatic full-system test covers one scenario.** On every change, CI runs the real system with load, a rush hour, a bad message, a duplicate and a crash of the matching service, then checks that no ride was lost or given two drivers. A pricing crash has only been tested by hand.
 - **Performance comes from one run on one machine.** It accepted about 1,500 requests per second, and every ride got a result. Matched rides levelled off at about 160 per second because the 1,000 simulated drivers are busy for 5 seconds per trip.
 - **The true top speed isn't known.** Things slow down near 1,500 requests per second, but the services, Docker and the load generator all shared one machine, so that may be the machine's limit.
 

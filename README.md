@@ -251,7 +251,7 @@ See [rps-benchmarking-setup.md](docs/rps-benchmarking-setup.md) for the runbook,
 - **Rewind detection is partial.** The offset tracker detects a rewind only when a re-fetched offset is at or below the last offset it tracked. A partition re-assigned starting *above* that offset is not detected, so the committed offset can move backwards and messages are redelivered. That stays within at-least-once, and handlers absorb duplicates.
 - **Two readers, two consumer groups.** assignment-service reads `ride.matched` in group `assignment-service` and `ride.unmatched` in group `assignment-service-unmatched`. A shared group would make the leader's metadata request for both topics fail as a whole while `ride.unmatched` does not exist yet (it is created lazily on the first business failure), stalling the success path too; with separate groups a missing `ride.unmatched` topic only delays the unmatched reader, and rebalances are independent.
 - **In-memory assignment store.** The assignment service keeps ride outcomes (matched and unmatched) in maps for benchmark verification; nothing is persisted, so after a restart a redelivered event is counted as new.
-- **Test coverage is unit-level.** Unit tests cover the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), surge rules, and the driver claim script (nearest-first, replay, final outcomes, concurrent claims) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes. No automated test uses real Kafka or Redis. The matched and unmatched paths, dead-lettering, duplicate handling, driver release and crash recovery were checked against a live stack with scripts that aren't in the repo, and consumer-group rewinds weren't covered. Next: integration tests against containerized Kafka and Redis.
+- **End-to-end coverage is one scenario.** `tools/e2e` runs on every CI build against real Kafka and Redis: load, a rush hour, a corrupt message, a duplicate and a force-kill of matching, then it checks the guarantees against the raw Kafka topics. Pricing crashes and consumer-group rewinds are only covered by the hand runs and unit tests. Unit tests cover the at-least-once consumer runner (ordered commits, retries, DLQ, drain, rewind epochs, panic recovery), surge rules, and the driver claim script (nearest-first, replay, final outcomes, concurrent claims) against an in-process Redis (miniredis), the shared event contracts (JSON round trips), the gateway's coordinate validation and the health probes.
 - **Readiness probes are shallow.** `/ready` checks that a broker accepts a TCP connection (and Redis answers `PING`). It does not verify that the topics exist or that consumer groups are assigned partitions.
 
 ---
@@ -415,6 +415,14 @@ Each service is its own Go module (tied together by `services/go.work` for local
 cd services/matching-service
 go vet ./... && go build ./... && go test ./...
 ```
+
+CI also runs the end-to-end test, which starts the whole stack in Docker and force-kills matching under load. It takes about 2 minutes after the image is built:
+
+```bash
+docker compose run --rm --build e2e
+```
+
+It sets the demo's demand to 0, so run `docker compose down` afterwards.
 
 ## License
 
