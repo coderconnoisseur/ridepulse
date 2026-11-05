@@ -111,6 +111,16 @@ services:
       redis:
         condition: service_healthy
 
+  # The end-to-end test: docker compose run --rm --build e2e
+  e2e:
+    <<: *ridepulse
+    command: e2e
+    profiles: [e2e]
+    restart: "no"
+    depends_on:
+      dashboard:
+        condition: service_healthy
+
   dashboard:
     <<: *ridepulse
     command: dashboard
